@@ -214,21 +214,3 @@ prio_table$sum_overlap <- rowSums(prio_table)
 prio_table$SNPs <- unique(unlist(l.snps.prio))
 rio::export(prio_table, "results/prioritized_AF_SNPs_comparison.csv")
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

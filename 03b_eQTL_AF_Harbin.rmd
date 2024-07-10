@@ -130,7 +130,7 @@ Parameters used:
 ### Harbin 7 PCs 250kb window
 
 ```{r message=F, warning=F}
-base.dir = "/home/lebf3/projects/rrg-glettre/lebf3/Human_AF/AF_V2G_multiome/" ######################### Change this for pub
+base.dir = getwd()
 useModel = modelLINEAR
 SNP_file_name = paste(base.dir, 
                       "data/Harbin/MatrixEQTL/SNP.txt",

@@ -180,7 +180,7 @@ Parameters used:
 ### CTSN 7 PCs 250kb window
 
 ```{r message=F, warning=F}
-base.dir = "/home/lebf3/projects/rrg-glettre/lebf3/Human_AF/AF_V2G_multiome/" ######################################## to change when published
+base.dir = getwd()
 useModel = modelLINEAR
 SNP_file_name = paste(base.dir, "data/CTSN/MatrixEQTL/SNP.txt", sep = "")
 snps_location_file_name = paste(base.dir,
