@@ -1,0 +1,378 @@
+---
+title: "eQTL_AF_CTSN"
+author: "Francis Leblanc"
+date: "21/01/2023"
+output:   
+  html_document:
+    toc: yes
+    toc_float: yes
+    code_folding: hide 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(2023)
+```
+
+# lib 
+
+```{r, echo = FALSE, warning = FALSE, results = 'hide', message = FALSE}
+library(parallel)
+library(Biobase)
+library(snpStats)
+library(ggplot2)
+library(MatrixEQTL)
+library(rio)
+library(psych)
+library(Hmisc)
+library(dplyr)
+```
+
+# Gathering GWAS data overlaping genotype and RNAseq + liftover
+
+```{r}
+G.c <- rio::import(
+  "data/external/gwas-association-downloaded_2023-01-31-EFO_0000275.tsv"
+  )
+colnames(G.c) <- gsub(" ", ".", colnames(G.c))
+meta.snps <- G.c %>%
+  dplyr::filter(FIRST.AUTHOR == "Miyazawa K" &
+                  is.na(REPLICATION.SAMPLE.SIZE) &
+                  INITIAL.SAMPLE.SIZE == "77,690 European ancestry cases, 1,167,040 European ancestry controls, 67,864 Japanese ancestry cases, 1,026,594 Japanese ancestry controls")
+
+meta.snps$hg38_pos <- paste0(meta.snps$CHR_ID, ":", meta.snps$CHR_POS)
+meta.snps$plink.lab <- paste0("chr", meta.snps$CHR_ID,
+                              ":",
+                              meta.snps$CHR_POS,
+                              ":")
+
+# Write a ID to be greped from plink.bim file
+write.table(meta.snps$plink.lab,
+            "data/external/AF.snp.locs.table",
+            row.names = FALSE,
+            col.names = FALSE,
+            quote = F)
+
+rio::export(meta.snps, "data/external/sentinel.snp.info.csv")
+```
+
+```{r}
+#### With grep, get all matching Ids from bim file
+#### Make sure line endings are ok!
+#### if not use > sed 's/\r//g'
+# module load plink/1.9b_6.21-x86_64
+# grep -f data/external/AF.snp.locs.table data/CTSN/plink/imputed.bim | cut -f 2 > data/CTSN/plink/AF_vars.txt
+```
+
+Extract variants in 250kb windows around sentinel
+```{r}
+range.extract <- data.frame(CHR = paste0("chr", meta.snps$CHR_ID),
+                            start = (meta.snps$CHR_POS - 250000),
+                            end = (meta.snps$CHR_POS + 250000),
+                            range = meta.snps$SNPS)
+write.table(range.extract,
+            "data/CTSN/eQTL_250kb.table",
+            row.names = FALSE,
+            col.names = FALSE,
+            quote = F)
+
+# plink -bfile data/CTSN/plink/imputed --extract range data/CTSN/eQTL_250kb.table --maf 0.05 --make-bed --out data/CTSN/plink/eQTL_250kb
+```
+
+filter on MAF (0.05), SNPs and individuals to create subsets files and run eQTL analysis.
+
+# Create input tables for MatrixEQTL
+
+## First the genotype table is created from plink files with snpStats package (0,1,2 notation for genotypes)
+
+```{r}
+# gene expression matrix for sample order
+GE <- readRDS("data/CTSN/RNAseq/vst.rds")
+
+fam <- "data/CTSN/plink/eQTL_250kb.fam"
+bim <- "data/CTSN/plink/eQTL_250kb.bim"
+bed <- "data/CTSN/plink/eQTL_250kb.bed"
+
+sample.ctsn <- read.plink(bed, bim, fam)
+geno.ctsn <- data.frame(t(as(sample.ctsn$genotypes, "numeric")))
+
+geno.ctsn.o <- data.frame(id = row.names(geno.ctsn), geno.ctsn[, colnames(GE)])
+write.table(geno.ctsn.o,
+            "data/CTSN/MatrixEQTL/SNP.txt",
+            row.names = FALSE,
+            quote = F ,
+            sep = "\t")
+```
+
+## 2nd create expression table
+
+```{r}
+GE <- data.frame(id = row.names(GE), GE)
+write.table(GE,
+            "data/CTSN/MatrixEQTL/expr_g.txt",
+            row.names = FALSE,
+            quote = F ,
+            sep = "\t")
+```
+
+## 3rd create location table of gene for cis query
+
+```{r}
+fdata <- readRDS("data/external/gencode.v32.annotation.genes.rds")
+fdata <- fdata[match(row.names(GE), fdata$gene_id), ]
+
+geneloc <- data.frame(geneid = fdata$gene_id,
+                      chr = fdata$seqnames,
+                      s1 = fdata$start,
+                      s2 = fdata$end)
+
+write.table(geneloc,
+            "data/external/geneloc.txt",
+            row.names = FALSE,
+            quote = F ,
+            sep = "\t")
+```
+
+## 4th create location table of SNPs for cis query
+
+```{r}
+snpsloc.ctsn <- data.frame(snp = sample.ctsn$map$snp.name,
+                           chr = paste0("chr", sample.ctsn$map$chromosome),
+                           pos = sample.ctsn$map$position)
+write.table(snpsloc.ctsn,
+            "data/CTSN/MatrixEQTL/eQTL_250kb_snpsloc.txt",
+            row.names = FALSE,
+            quote = F ,
+            sep = "\t")
+```
+
+## 5th Create covariate table with numerical values
+
+#### 7PC as covariates 
+
+```{r}
+meta.ctsn <- readRDS("data/CTSN/RNAseq/meta_cov.7PCs.rds")
+
+### code M as 0 and F as 1, Ctl as 0 and AF as 1
+meta.ctsn$sex <- ifelse(meta.ctsn$sex == "Female",  1,  0)
+meta.ctsn$condition <- ifelse(meta.ctsn$condition == "AF",  1,  0)
+meta.ctsn.t <- t(meta.ctsn)
+
+Covariates.ctsn <-data.frame(id = row.names(meta.ctsn.t), meta.ctsn.t)
+Covariates.ctsn_noAF <- Covariates.ctsn[-c(2), ]
+write.table(Covariates.ctsn_noAF,
+            "data/CTSN/MatrixEQTL/Covariates_noAF_7PCs.txt",
+            row.names = FALSE,
+            quote = F ,
+            sep = "\t")
+```
+
+# MatrixEQTL in cis analysis
+Now we can lunch the eQTL analysis from MatrixEQTL package
+Parameters used:
+
+* linear model
+* Cis distance : 1MB
+* coaviates : Sex 
+* output only paires in trans with padj, < 0.01
+
+
+### CTSN 7 PCs 250kb window
+
+```{r message=F, warning=F}
+base.dir = "/home/lebf3/projects/rrg-glettre/lebf3/Human_AF/AF_V2G_multiome/" ######################################## to change when published
+useModel = modelLINEAR
+SNP_file_name = paste(base.dir, "data/CTSN/MatrixEQTL/SNP.txt", sep = "")
+snps_location_file_name = paste(base.dir,
+                                "data/CTSN/MatrixEQTL/eQTL_250kb_snpsloc.txt",
+                                sep = "")
+expression_file_name = paste(base.dir, 
+                             "data/CTSN/MatrixEQTL/expr_g.txt", 
+                             sep = "")
+gene_location_file_name = paste(base.dir, 
+                                "data/external/geneloc.txt", 
+                                sep = "")
+covariates_file_name = paste(base.dir,
+                             "data/CTSN/MatrixEQTL/Covariates_noAF_7PCs.txt",
+                             sep = "")
+
+# Output file name
+output_file_name_cis = tempfile();
+output_file_name_tra = tempfile();
+
+# Only associations significant at this level will be saved
+pvOutputThreshold_cis = 1;
+pvOutputThreshold_tra = 0;
+
+errorCovariance = numeric() 
+
+# Distance for local gene-SNP pairs
+cisDist = 1e6;
+
+## Load genotype data
+snps = SlicedData$new()
+snps$fileDelimiter = "\t"      # the TAB character
+snps$fileOmitCharacters = "NA" # denote missing values;
+snps$fileSkipRows = 1     # one row of column labels
+snps$fileSkipColumns = 1     # one column of row labels
+snps$fileSliceSize = 2000    # read file in pieces of 2,000 rows
+snps$LoadFile( SNP_file_name )
+
+## Load gene expression data
+gene = SlicedData$new();
+gene$fileDelimiter = "\t";      # the TAB character
+gene$fileOmitCharacters = "NA"; # denote missing values;
+gene$fileSkipRows = 1;          # one row of column labels
+gene$fileSkipColumns = 1;       # one column of row labels
+gene$fileSliceSize = 2000;      # read file in slices of 2,000 rows
+gene$LoadFile(expression_file_name);
+
+## Load covariates
+cvrt = SlicedData$new();
+cvrt$fileDelimiter = "\t";      # the TAB character
+cvrt$fileOmitCharacters = "NA"; # denote missing values;
+cvrt$fileSkipRows = 1;          # one row of column labels
+cvrt$fileSkipColumns = 1;       # one column of row labels
+if(length(covariates_file_name) > 0) {
+cvrt$LoadFile(covariates_file_name);
+}
+
+## Run the analysis
+snpspos = read.table(snps_location_file_name,
+                     header = TRUE, 
+                     stringsAsFactors = FALSE);
+genepos = read.table(gene_location_file_name, 
+                     header = TRUE, 
+                     stringsAsFactors = FALSE);
+
+me = Matrix_eQTL_main(snps = snps,
+                      gene = gene,
+                      cvrt = cvrt,
+                      output_file_name = output_file_name_tra,
+                      pvOutputThreshold = pvOutputThreshold_tra,
+                      useModel = useModel,
+                      errorCovariance = errorCovariance,
+                      verbose = TRUE,
+                      output_file_name.cis = output_file_name_cis,
+                      pvOutputThreshold.cis = pvOutputThreshold_cis,
+                      snpspos = snpspos,
+                      genepos = genepos,
+                      cisDist = cisDist,
+                      pvalue.hist = "qqplot",
+                      min.pv.by.genesnp = FALSE,
+                      noFDRsaveMemory = FALSE);
+
+unlink(output_file_name_tra);
+unlink(output_file_name_cis);
+saveRDS(me, "data/CTSN/MatrixEQTL/250kb_eQTLs_7PCs.RDS")
+```
+
+## Annotation
+
+```{r}
+me <- readRDS("data/CTSN/MatrixEQTL/250kb_eQTLs_7PCs.RDS")
+lead.snps <- read.delim("data/CTSN/plink/AF_vars.txt", header = F) 
+fdata <- readRDS("data/external/gencode.v32.annotation.genes.rds")
+
+lead.snps$pos <- limma::strsplit2(lead.snps$V1, ":")[, 2]
+meta.snps$plink_id <- lead.snps$V1[match(meta.snps$CHR_POS, lead.snps$pos)]
+
+cis_eqtls  <- dplyr::filter(me$cis$eqtls, snps %in% lead.snps$V1) 
+cis_eqtls$GENEID <- limma::strsplit2(cis_eqtls$gene, "[.]")[, 1]
+cis_eqtls <- cbind(cis_eqtls,
+                   fdata[match(cis_eqtls$GENEID, fdata$ensembl_gene_id),
+                         c("gene_name", "seqnames", "start", "gene_type")])
+
+cis_eqtls$snps_gene <- paste0(cis_eqtls$snps, "_", cis_eqtls$gene_name)
+cis_eqtls[, c("rsid", "Meta_P")] <- meta.snps[
+  match(cis_eqtls$snps, meta.snps$plink_id), c("SNPS", "P-VALUE")
+  ]
+
+saveRDS(cis_eqtls, "results/CTSN_cis_eQTLs.sex.7PCs.RDS") 
+```
+
+
+##  qq plot with GGplot (Figure 1A)
+
+```{r}
+cis_eqtls <- readRDS("results/CTSN_cis_eQTLs.sex.7PCs.RDS")
+
+df.ci <- data.frame(
+  expected = -log10(ppoints(nrow(cis_eqtls))),
+  clower   = -log10(qbeta(p = (1 - 0.95) / 2,
+                          shape1 = 1:nrow(cis_eqtls),
+                          shape2 = nrow(cis_eqtls):1)),
+  cupper   = -log10(qbeta(p = (1 + 0.95) / 2,
+                          shape1 = 1:nrow(cis_eqtls),
+                          shape2 = nrow(cis_eqtls):1)),
+  pvalue = -log10(cis_eqtls$pvalue[order(cis_eqtls$pvalue)]),
+  gene = cis_eqtls$gene_name[order(cis_eqtls$pvalue)]
+)
+df.ci$gene[20:nrow(df.ci)] <- NA
+
+p <- ggplot(df.ci) +
+  geom_point(aes(x = expected, y = pvalue), alpha = 0.5, size = 1) +
+  ggrepel::geom_text_repel(aes(x = expected, y = pvalue, label = gene),
+                           size = 3,
+                           max.overlaps = 30) +
+  geom_abline(intercept = 0,
+              slope = 1,
+              alpha = 0.5) +
+  geom_line(data = df.ci, aes(expected, cupper), linetype = 2) +
+  geom_line(data = df.ci, aes(expected, clower), linetype = 2) +
+  cowplot::theme_cowplot() +
+  ylab(substitute(paste("Observed -log10(", italic("P"), ")"))) +
+  xlab(substitute(paste("Expected -log10(", italic("P"), ")"))) +
+  ggtitle("CTSN", subtitle = paste0(nrow(cis_eqtls), " tested cis-eQTL"))
+p
+ggsave("figs/eQTL_AF_CTSN/QQ-plot_cis.eQTL_CTSN.png", p, width = 6, height = 4)
+```
+
+# eQTLs genotype:condition interaction 
+
+```{r}
+cis_eqtls <- readRDS("results/CTSN_cis_eQTLs.sex.7PCs.RDS")
+GE <- read.table("data/CTSN/MatrixEQTL/expr_g.txt", header = T)
+meta.ctsn <- readRDS("data/CTSN/RNAseq/meta_cov.7PCs.rds")
+geno.o <- read.table("data/CTSN/MatrixEQTL/SNP.txt",
+                     header = T,
+                     row.names = 1,
+                     sep = "\t")
+
+# Compute lm interactions for each SNP-gene pair
+interactions.c <- lapply(1:nrow(cis_eqtls), function(i) {
+  df <- meta.ctsn
+  snp <- as.character(cis_eqtls[i, "snps"])
+  df$genotype <- t(geno.o[snp, ])
+  df$genotype <- df$genotype[, 1]
+  df$exprs <- GE[which(GE$id == cis_eqtls[i, "gene"]), -1] %>%
+    t() %>%
+    .[, 1]
+  gene.name <- cis_eqtls$gene_name[i]
+  
+  # Create formula for linear model
+  fs <- as.formula(paste("exprs ~ ", paste(
+    c("genotype:condition", colnames(df)[-ncol(df)]), collapse = "+"
+  )))
+  m <- lm(formula = fs , df)
+  
+  m2 <- summary(m)$coefficients[, 4]
+  m2["snp_gene.name"] <- paste0(snp, "_", gene.name)
+  m2
+}) %>% 
+  do.call(rbind, .)
+
+# make all columns numeric except SNP_gene
+interactions.c.df <- as.data.frame(interactions.c)
+interactions.c.df[, -ncol(interactions.c.df)] <- apply(
+  interactions.c.df[, -ncol(interactions.c.df)], 2, as.numeric
+  ) 
+
+# FDR adjust
+interactions.c.df$genotype.condition_FDR <- p.adjust( 
+  interactions.c.df$`genotype:condition`, method = "fdr"
+  )
+cis_eqtls <- cbind(cis_eqtls, interactions.c.df[, c("genotype:conditionSR", 
+                                                    "genotype.condition_FDR")])
+saveRDS(cis_eqtls, "results/CTSN_cis_interactions.7PCs.RDS")
+```

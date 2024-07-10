@@ -1,0 +1,221 @@
+---
+title: "cCREs_overlaps"
+author: "Francis Leblanc"
+date: '2023-02-06'
+output: html_document
+---
+
+```{r knitr::opts_chunk$set(echo = TRUE),message=FALSE, warning=FALSE}
+library(Signac)
+library(GenomicRanges)
+library(rtracklayer)
+library(dplyr)
+library(tidyr)
+library(limma)
+set.seed(2023)
+```
+
+# Table S6 (table 1 eGenes differential expression)
+
+```{r}
+eQTL_genes <- read.csv("results/Table_1.csv", row.names = 1) %>% 
+  filter(FDR_CTSN < 0.05 | FDR_Harbin < 0.05) %>% 
+  pull(gene_name) %>%
+  unique()
+
+cols_keep <- c("baseMean", "log2FoldChange", "padj", "gene_name")
+DEG.c <- readRDS("data/CTSN/RNAseq/DEG.rds")[, cols_keep]
+DEG.h <- readRDS("data/Harbin/RNAseq/DEG.rds")[, cols_keep]
+
+cols_rename <- c("baseMean_CTSN" , "L2FC_CTSN", "FDR_CTSN", "gene_name")
+colnames(DEG.c) <- cols_rename
+DEG.c$GENEID <- row.names(DEG.c)
+cols_rename <- c("baseMean_Harbin" , "L2FC_Harbin", "FDR_Harbin", "gene_name")
+colnames(DEG.h) <- cols_rename
+DEG.h$GENEID <- row.names(DEG.h)
+
+DEG <- merge(DEG.c, DEG.h, all = T, by = c("GENEID", "gene_name"))
+
+DEG <- DEG[match(eQTL_genes, DEG$gene_name), ]
+rio::export(DEG, "results/TableS6_DEG_test.csv") 
+```
+
+# Table 2 : prioritized SNPs PiP
+
+## Get prioritized SNPs info
+
+```{r}
+res_eQTL <- rio::import("results/eQTL_main_table.cs.csv")
+merged.res <- readRDS("results/credible.sets.merged.rds")
+cis_eqtls.c <- readRDS("data/CTSN/cis_eqtls.rds")
+cis_eqtls.h <- readRDS("data/Harbin/cis_eqtls.rds")
+
+# Select Prioritized SNPs and get their PiPs
+prio.snp <- res_eQTL %>% 
+  tidyr::separate_longer_delim(Prioritized, ",") %>% 
+  dplyr::filter(Prioritized != "")
+
+prio_PiP <- lapply(1:nrow(prio.snp), function(i) {
+  keep <- merged.res %>%
+    filter(BBJ_variant_id == prio.snp$Prioritized[i] & gene == prio.snp$gene[i])
+  keep$PPi[match(c("BBJ_GWAS", "CTSN_eQTL", "Harbin_eQTL"), keep$dataset)] %>%
+    round(3)
+}) %>%
+  do.call(rbind, .)
+
+colnames(prio_PiP) <- c("PiP_BBJ_GWAS","PiP_CTSN_eQTL","PiP_Harbin_eQTL")
+prio.snp <- cbind(prio.snp, prio_PiP)
+
+# get their MAFs and eQTL p-values
+cols_keep <- c("pvalue",
+               "MAF",
+               "BBJ_p_value",
+               "BBJ_MAF",
+               "gene",
+               "BBJ_variant_id")
+prio.snp <- merge(prio.snp, 
+                  cis_eqtls.c[, cols_keep],
+                  by.x = c("gene", "rsid"),
+                  by.y = c("gene", "BBJ_variant_id"))
+
+prio.snp <- rename(prio.snp, CTSN_pvalue = pvalue, CTSN_MAF = MAF)
+
+cols_keep <- c("pvalue", "MAF", "gene", "BBJ_variant_id")
+prio.snp <- merge(prio.snp, 
+                  cis_eqtls.h[, cols_keep], 
+                  by.x = c("gene", "rsid"),
+                  by.y = c("gene", "BBJ_variant_id"))
+prio.snp <- rename(prio.snp, Harbin_pvalue = pvalue, Harbin_MAF = MAF)
+```
+
+## encode
+
+```{r}
+## get SNP overlap with cCREs
+# make granges for snps and encode
+encode.ccre <- rio::import("../geno_AF/data/external/Encode/encodeCcreCombined.txt")
+encode.ccre.gr <- GRanges(seqnames = encode.ccre[, '#chrom'],
+                          IRanges(start = encode.ccre$chromStart, 
+                                  end = encode.ccre$chromEnd))
+encode.ccre.gr@elementMetadata <- DataFrame(encode.ccre[, -c(1:3)])
+
+prio.snp$pos <- sapply(1:nrow(prio.snp), function(i) {
+  merged.res %>%
+    filter(BBJ_variant_id == prio.snp$Prioritized[i] &
+             gene == prio.snp$gene[i]) %>%
+    pull(chr_pos) %>%
+    strsplit2(x = ., "_") %>%
+    .[1, 2]
+})
+
+prio.snp.gr <- GRanges(seqnames = prio.snp$seqnames,
+                       IRanges(start = as.numeric(prio.snp$pos),
+                               end = as.numeric(prio.snp$pos)))
+prio.snp.gr$snp <- prio.snp$Prioritized
+
+# get overlap
+ovelaping_peaks <- findOverlaps(prio.snp.gr, encode.ccre.gr)
+cols_keep <- c("ucscLabel","encodeLabel","ccre","description")
+encode.ol.df <- encode.ccre.gr[ovelaping_peaks@to]@elementMetadata[,] %>% 
+  as.data.frame()
+encode.ol.df$snp <- prio.snp.gr[ovelaping_peaks@from]$snp
+
+prio.snp <- merge(prio.snp,
+                  encode.ol.df,
+                  by.x = "Prioritized",
+                  by.y = "snp",
+                  all.x = T)
+```
+
+## Catlas (Table 2 & S10)
+Epimap was added manually in word table, see epimap_prioritized_overlap.csv
+
+```{r}
+#### get overlap with cCREs
+# make granges for Catlas
+ccre.path <- "data/external/Catlas/"
+
+# import Catlas cCRE data
+ccre <- rtracklayer::import(paste0(ccre.path, "cCREs.bed.gz"))
+
+# All cell combined peaks with celltype attribution (sparse matrix format)
+mm <- Matrix::readMM(paste0(ccre.path, "matrix.tsv.gz")) 
+mm <- as.matrix(mm)
+colnames(mm) <- read.table(paste0(ccre.path, "celltypes.txt.gz"),
+                           header = F,
+                           sep = ":")[, 1]
+ccre@elementMetadata <- cbind(ccre@elementMetadata, mm)
+
+# get overlap and cell-types in which cCREs were called in
+ovelaping_peaks <- findOverlaps(prio.snp.gr, ccre)
+l.types <- apply(ccre[ovelaping_peaks@to]@elementMetadata, 1, which)
+
+Catlas.ol.df <- data.frame(
+  Catlas.peak = GRangesToString(ccre[ovelaping_peaks@to]),
+  Catlas.p_cell_types = sapply(l.types, function(x) {
+    paste(names(x), collapse = ",")
+  }),
+  snp = prio.snp.gr[ovelaping_peaks@from]$snp
+)
+
+prio.snp <- merge(prio.snp,
+                  Catlas.ol.df,
+                  by.x = "Prioritized",
+                  by.y = "snp",
+                  all.x = T)
+
+rio::export(prio.snp[!duplicated(prio.snp), ], "results/Table_S10.csv") 
+```
+
+# Epimap
+https://personal.broadinstitute.org/cboix/epimap/links/pergroup/links_by_group.heart.tsv.gz 
+```{r}
+# SNPs to overlap
+prio.snps.epi <- rio::import("data/external/Epimap/PrioritizedVariants_EpiMap.xlsx") 
+prio.snps.epi[, c("chr", "pos")] <- strsplit2(prio.snps.epi$`CHR:POS (hg19)`,
+                                              ":")
+prio.snps.epi$chr <- paste0("chr", prio.snps.epi$chr)
+
+# get Heart links predictions
+epi <- read.table("data/external/Epimap/links_by_group.heart.tsv.gz", 
+                    sep = "\t", 
+                    header = T) %>%
+    filter(gene %in% prio.snps.epi$ENSG)
+
+# find overlap with SNPs
+prio.snps.epi.gr <- GRanges(seqnames = prio.snps.epi$chr,
+                            IRanges(start = as.numeric(prio.snps.epi$pos),
+                                    end = as.numeric(prio.snps.epi$pos)),
+                            snp = prio.snps.epi$rsID)
+
+epi_gr <- GRanges(seqnames = epi$chr,
+                    IRanges(start = as.numeric(epi$start),
+                            end = as.numeric(epi$end)),
+                    gene = epi$gene,
+                    name = epi$name,
+                    score = epi$score)
+
+ovelaping_peaks <- findOverlaps(prio.snps.epi.gr, epi_gr)
+
+epi_df <- as.data.frame(epi_gr[ovelaping_peaks@to])
+epi_df$gene.name <- prio.snps.epi$Gene[match(epi_df$gene, prio.snps.epi$ENSG)]
+epi_df <- distinct(epi_df, .keep_all = TRUE)
+
+# Lifover
+ahub <- AnnotationHub::AnnotationHub() # snapshotDate(): 2022-10-31
+ahub.chain <- subset(ahub, rdataclass == "ChainFile" & species == "Homo sapiens")
+chain <- ahub.chain[ahub.chain$title == "hg19ToHg38.over.chain.gz"]
+chain <- chain[[1]]
+
+grl2.hg38 <- liftOver(
+  makeGRangesFromDataFrame(epi_df, keep.extra.columns = T), 
+  chain
+  )
+
+grl2.hg38 <- unlist(grl2.hg38)
+epi_df$hg38 <- GRangesToString(grl2.hg38)
+epi_df$rsID <- c("rs7612445", rep("rs242557", 4))
+
+rio::export(epi_df, "results/epimap_prioritized_overlap.csv")
+```
+

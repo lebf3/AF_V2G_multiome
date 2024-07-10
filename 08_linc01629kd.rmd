@@ -1,0 +1,219 @@
+---
+title: "Linc01629kd"
+author: "Francis Leblanc"
+date: "2023-05-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(2023)
+```
+
+
+```{r}
+library(tximport)
+library(DESeq2)
+library(ggpubr)
+library(cowplot)
+library(dplyr)
+library(rbioapi)
+theme_set(cowplot::theme_cowplot())
+
+small_legend <- theme(legend.title = element_text(size = 9),
+                      legend.key.size = unit(0.15, 'in'),
+                      legend.text = element_text(size = 9))
+```
+
+# Gene level quantification (Figures 4A, B and S15)
+
+## PCA (Fig. S15)
+
+```{r}
+samples <- list.files("data/linc01629/kallisto/", pattern = "CM_")
+meta <- data.frame(sample = c("kd1", "kd2", "kd3", "ctl1", "ctl2", "ctl3"), 
+                   condition = c(rep("kd", 3), rep("ctl", 3)), 
+                   path = paste0("data/linc01629/kallisto/", 
+                                 samples, 
+                                 "/abundance.h5"))
+
+tx2gene <- rio::import("data/external/tx2gene.gencode.v32.tsv.gz")
+txi.kallisto <- tximport(meta$path, 
+                         type = "kallisto", 
+                         tx2gene = tx2gene[, 1:2],
+                         ignoreAfterBar = TRUE)
+dds <- DESeqDataSetFromTximport(txi.kallisto, meta, design = ~ condition)
+
+# PCA
+vst <- vst(dds, blind = T)
+rv <- rowVars(assay(vst))
+select <- order(rv, decreasing = TRUE)[seq_len(500)]
+pca <- prcomp(t(assay(vst)[select, ]))
+df.pca <- cbind(as.data.frame(pca$x), meta[, c("condition", "sample")])
+df.pca$condition <- recode(df.pca$condition, 'kd' = "LINC01629", 'ctl' = "NTC")
+
+ggplot(df.pca, aes(PC1, PC2, color=condition, label = sample)) +  
+  geom_point(size = 3) +
+  labs(color = "Condition")
+ggsave("figs/linc01629/PCA.png", height = 5)
+```
+
+## DEG (Figs. 4A, B)
+
+```{r}
+dds_cond <- DESeq(dds)
+
+# with shrinkage (Table S12)
+res <- lfcShrink(dds_cond, coef = "condition_kd_vs_ctl", type = c("ashr"))
+res.df <- as.data.frame(res)
+res.df$gene <- tx2gene$SYMB[match(row.names(res.df), tx2gene$GENEID)]
+rio::export(res.df, "results/linc01629_DE_results_shrunk.csv")
+res.df.f <- filter(res.df, !is.na(padj))
+
+top10 <- slice_min(res.df.f, padj, n = 10) %>% 
+  pull(gene)
+
+# OpenTarget 
+OT <- rio::import("data/external/Prioritized_genes/Open_target_Nielsen.csv") %>%
+  pull(L2G) %>% 
+  strsplit(", ") %>%
+  unlist() %>% 
+  unique() 
+
+keep <- filter(res.df, padj < 0.1) %>% 
+  pull(gene) 
+OT <- OT[OT %in% keep]
+
+res.df.f$label <- ifelse(res.df.f$gene %in% c(top10, OT, "LINC01629"),
+                         res.df.f$gene, NA)
+res.df.f$color <- ifelse(res.df.f$gene %in% OT,
+                         "darkred", "black")
+
+# Volcano plot (Figure 4B)
+p.v <- res.df.f %>% 
+  filter(!is.na(padj)) %>% 
+  ggplot(aes(x = log2FoldChange, y = -log10(pvalue), label = label)) +
+  geom_point(color = res.df.f$color) +
+  ggrepel::geom_label_repel(color = res.df.f$color) 
+
+# boxplot (Figure 4A)
+meta$LINC01629 <- assay(dds)["ENSG00000258602.1", ]
+meta$condition <- recode(meta$condition, 'kd' = "LINC01629-KRAB", 'ctl' = "NTC")
+p.b <- ggpubr::ggboxplot(meta,
+                         x = "condition",
+                         y = "LINC01629",
+                         add = "jitter",
+                         ylab = "LINC01629 raw counts",
+                         xlab = "Condition") 
+p.b <- p.b + 
+  scale_x_discrete(labels = c(expression(paste("LINC01629" ^ KRAB)), "NTC")) +
+  ylim(0,32) +
+  annotate("text",
+           x = 1.5,
+           y = 29,
+           label = "p-value = 0.002\nFDR = 0.09\nL2FC = -0.51")
+
+# save counts table
+df <- counts(dds)
+colnames(df) <- colData(dds)$sample
+write.table(df,
+            "data/linc01629/counts_LINC01629_KD.tsv", 
+            row.names = T, 
+            sep = "\t")
+write.table(meta[, 1:2], 
+            "data/linc01629/meta_LINC01629_KD.tsv", 
+            row.names = T, 
+            sep = "\t",
+            quote=F)
+```
+
+
+# ORA (Figure 4C)
+
+## Down DEG
+
+```{r}
+res.df <- rio::import("results/linc01629_DE_results_shrunk.csv")
+DEG <- filter(res.df, padj < 0.1 & log2FoldChange < 0)
+bkgd.genes <- filter(res.df, baseMean > 1)
+
+enriched <- rba_panther_enrich(genes = DEG$gene, 
+                               organism = 9606,
+                               annot_dataset = "GO:0008150",
+                               cutoff = 0.05,
+                               ref_genes = bkgd.genes$gene,
+                               ref_organism = 9606,
+                               correction = "BONFERRONI")
+
+path.down <- enriched$result
+path.down.top <- path.down %>%
+  dplyr::filter(!is.na(term.id)) %>%
+  slice_max(fold_enrichment, n = 10) %>%
+  arrange(pValue) %>%
+  mutate(pathway = factor(term.label, levels = term.label),
+         overlap = number_in_list)
+
+p1 <- path.down.top %>%
+  ggplot(aes(y = pathway,
+             x = -log10(pValue),
+             fill = fold_enrichment,
+             size = overlap)) +
+  geom_point(shape = 21) +
+  scale_fill_gradient2(low = "darkred", mid = "white", high = "blue") +
+  scale_size(range = c(3, 6)) +
+  ylab(NULL) + 
+  xlab("-log10(p-value)") +
+  labs(fill = "Fold enrichment", size = "gene overlap") +
+  theme_cowplot() +
+  small_legend +
+  ggtitle(expression(paste("LINC01629" ^ KRAB, " down-regulated")))
+```
+
+## Up DEG
+
+```{r}
+DEG <- res.df %>% dplyr::filter(padj < 0.1 & log2FoldChange > 0) 
+
+enriched <- rba_panther_enrich(genes = DEG$gene,
+                               organism = 9606,
+                               annot_dataset = "GO:0008150",
+                               cutoff = 0.05,
+                               ref_genes = bkgd.genes$gene,
+                               ref_organism = 9606,
+                               correction = "BONFERRONI")
+
+path.up <- enriched$result
+
+path.up.top <- path.up %>% 
+  dplyr::filter(!is.na(term.id)) %>% 
+  slice_max(fold_enrichment, n = 10) %>% 
+  arrange(pValue) %>% 
+  mutate(pathway = factor(term.label, levels = term.label),
+         overlap = number_in_list)
+
+p2 <- path.up.top %>% 
+  ggplot(aes(y = pathway,
+             x = -log10(pValue),
+             fill = fold_enrichment,
+             size = overlap)) +
+  geom_point(shape = 21) + 
+  scale_fill_gradient2(low = "blue", mid = "white", high = "darkred") + 
+  scale_size(range = c(3, 6)) +
+  ylab(NULL) + 
+  xlab("-log10(p-value)") +
+  labs(fill = "Fold enrichment", size = "gene overlap")+
+  theme_cowplot() +
+  small_legend +
+  ggtitle(expression(paste("LINC01629" ^ KRAB, " up-regulated")))
+
+design <- "
+  2111
+  3111
+  4111
+"
+ggsave(plot = p.v + p.b + p1 + p2 + patchwork::plot_layout(design = design), 
+       "figs/linc01629/Fig4.png", 
+       width = 16, 
+       height = 10.66)
+```
+

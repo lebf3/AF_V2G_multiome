@@ -1,0 +1,234 @@
+---
+title: "AF_gene_SNPs_prioritization_comparison"
+author: "Francis Leblanc"
+date: "2024-02-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(UpSetR)
+library(dplyr)
+```
+
+# Compare with other prioritized AF genes
+
+## Prioritized gene sets
+
+```{r}
+tx2gene <- rio::import("data/external/tx2gene.gencode.v32.tsv.gz")
+tx2gene$stableID <- tx2gene$GENEID %>% 
+  limma::strsplit2("[.]") %>% 
+  .[,1]
+
+eGenes <- rio::import("results/Table_1.csv") %>% 
+  filter(FDR_CTSN < 0.05 | FDR_Harbin < 0.05) %>% 
+  pull(gene_name) %>% 
+  unique()
+eGenes <- c("FAM13B", eGenes)
+
+# Miyazawa et al.
+Miyazawa_twas <- rio::import(
+  "data/external/Prioritized_genes/Miyazawa.et.al.TS6_RAA.csv"
+  ) %>% 
+  mutate(stableID = limma::strsplit2(Gene, "[.]")[, 1])
+
+Miyazawa_twas$gene_name <- tx2gene$SYMB[match(Miyazawa_twas$stableID, 
+                                              tx2gene$stableID)]
+
+# Nielsen et al.
+Nielsen <- rio::import(
+  "data/external/Prioritized_genes/Nielsen.et.al.TS11.csv", 
+  header = T
+  )
+
+# OpenTarget 
+OT <- rio::import("data/external/Prioritized_genes/Open_target_Nielsen.csv")
+OT_L2G <- OT$L2G %>% 
+  strsplit(", ") %>% 
+  unlist() %>% 
+  unique()
+OT_coloc <- OT$Colocalisation %>% 
+  strsplit(", ") %>% 
+  unlist() %>%
+  unique()
+OT_coloc <- OT_coloc[-grep("TNFSF12-TNFSF13", OT_coloc, fixed = T)]
+
+# Selewa et al.
+Selewa <- rio::import("data/external/Prioritized_genes/Selewa.et.al_TS8.csv") %>% 
+  filter(`Gene PIP (> 0.1)` >= 0.8) %>% 
+  pull(Gene)
+
+# Assum et al
+Assum <- rio::import("data/external/Prioritized_genes/Assum.et.al.TS5.tsv") %>% 
+  pull(`QTL gene`) %>% 
+  unique()
+
+# Hocker et al
+Hocker <- rio::import("data/external/Prioritized_genes/Hocker.et.al_TS19_genes_variants_PPi_0.csv") %>% 
+  .[colnames(.)[!duplicated(colnames(.))]] %>%  
+  pull(`Gene Name`) %>% 
+  unique()
+
+# Ouwerkerk_2019 et al
+Ouwerkerk_2019 <- rio::import("data/external/Prioritized_genes/Ouwerkerk.et.al_2019_TS1.csv") %>%
+  filter(`score p<10-6` >= 11) %>%
+  pull(genesymbol)  %>%
+  unique()
+
+# Zhang et al
+Zhang <- rio::import("data/external/Prioritized_genes/Zhang.et.al.TS5.csv") %>%
+  filter(`Disease or Trait` == "Atrial_fibrillation") %>%
+  pull(`Target genes (ABC score > 0.015, any cell type)`) %>%
+  strsplit(., ",") %>%
+  unlist() %>%
+  unique()
+Zhang <- Zhang[-1]
+```
+
+## plot prioritized genes upset (Fig. S2)
+
+```{r}
+l.af.prio <- list(OT_coloc,
+                  OT_L2G,
+                  Zhang,
+                  Ouwerkerk_2019,
+                  Selewa,
+                  Hocker,
+                  Assum,
+                  eGenes)
+
+names(l.af.prio) <- c("OT_coloc",
+                      "OT_L2G",
+                      "Zhang.et.al",
+                      "Ouwerkerk.et.al.2019",
+                      "Selewa.et.al",
+                      "Hocker.et.al",
+                      "Assum.et.al",
+                      "This study")
+
+png("figs/AF_gene_SNPs_prioritization_comparison/Upset_prioritized.genes_comparison.png",
+    width = 8,
+    height = 4,
+    units = "in",
+    res = 300)
+
+upset(fromList(l.af.prio),
+      keep.order = T,
+      order.by = "freq",
+      sets = names(l.af.prio),
+      nintersects = 100,
+      nsets = 11)
+
+dev.off()
+```
+
+## save (Table S4)
+
+```{r}
+prio_table <- as.data.frame(fromList(l.af.prio)) %>% 
+  mutate(sum_overlap = rowSums(.),
+         Gene = unique(unlist(l.af.prio)))
+rio::export(prio_table, "results/prioritized_AF_genes_comparison.csv")
+```
+
+# Compare with other prioritized AF SNPs
+
+```{r}
+our_snps <- rio::import("results/Table_S10.csv") %>% 
+  pull(Prioritized) %>% 
+  unique()
+
+# Assum et al
+Assum <- rio::import("data/external/Prioritized_SNPs/Assum.et.al.TS5.tsv") %>% 
+  pull(`QTL variant`) %>% 
+  unique()
+
+# Hocker et al
+Hocker <- rio::import("data/external/Prioritized_SNPs/Hocker.et.al_TS19_genes_variants_PPi_0.1.csv") %>% 
+  .[colnames(.)[!duplicated(colnames(.))]] %>% 
+  pull(variant_rsID) %>% 
+  unique()
+
+# Ouwerkerk_2020 et al
+Ouwerkerk_2020 <- rio::import("data/external/Prioritized_SNPs/Ouwerkerk.et.al.2020_TS5.tsv") %>% 
+  pull(SNP) %>% 
+  unique()
+
+# Ouwerkerk_2019 et al
+Ouwerkerk_2019 <- rio::import("data/external/Prioritized_SNPs/Ouwerkerk.et.al_2019_TS2.csv") %>% 
+  pull(SNP) %>% 
+  unique()
+
+# Selewa et al
+Selewa <- rio::import("data/external/Prioritized_SNPs/Selewa.et.al.TS3.csv") %>% 
+  filter(PIP > 0.5) %>% 
+  pull(SNP) %>% 
+  unique()
+
+# Zhang et al
+Zhang <- rio::import("data/external/Prioritized_SNPs/Zhang.et.al.TS5.csv") %>% 
+  filter(`Disease or Trait` == "Atrial_fibrillation") %>% 
+  pull(`SNP rsID`) %>% 
+  unique()
+```
+
+## plot upset (Fig. S4)
+
+```{r}
+l.snps.prio <- list(our_snps, 
+                    Assum, 
+                    Hocker,
+                    Ouwerkerk_2020, 
+                    Ouwerkerk_2019,
+                    Selewa, 
+                    Zhang)
+names(l.snps.prio) <-c("This study",
+                       "Assum et al.",
+                       "Hocker et al.",
+                       "Ouwerkerk et al. 2020",
+                       "Ouwerkerk et al. 2019",
+                       "Selewa et al.",
+                       "Zhang et al.")
+
+png("figs/AF_gene_SNPs_prioritization_comparison/Upset_prioritized.SNPs_comparison.png", 
+    width = 6, 
+    height = 4, 
+    units = "in",
+    res = 300) 
+
+upset(fromList(l.snps.prio),
+      keep.order = T, 
+      order.by = "freq",
+      nsets = 7)
+
+dev.off()
+```
+
+## save (Table S11)
+
+```{r}
+prio_table <- as.data.frame(fromList(l.snps.prio))
+prio_table$sum_overlap <- rowSums(prio_table)
+prio_table$SNPs <- unique(unlist(l.snps.prio))
+rio::export(prio_table, "results/prioritized_AF_SNPs_comparison.csv")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

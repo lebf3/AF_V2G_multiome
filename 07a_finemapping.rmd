@@ -1,0 +1,325 @@
+---
+title: "Finemapping"
+author: "Francis Leblanc"
+date: '2023-02-06'
+output: html_document
+---
+
+```{r knitr::opts_chunk$set(echo = TRUE), message = FALSE, warning = FALSE}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(limma)
+set.seed(2023)
+```
+
+# Finemapping function
+
+```{r}
+bayesfactor <- function(objct, chr, pos) {
+  min <- pos - 250000
+  max <- pos + 250000
+  encore_result <- subset(objct,
+                          CHROM == chr &
+                            dplyr::between(objct$POS, min, max) &
+                            !is.na(BETA) & !is.na(SE))
+  
+  encore_result$V <- (encore_result$SE) ^ 2
+  encore_result$Z <- encore_result$BETA / encore_result$SE
+  W <- .04
+  encore_result$aBF <-
+    sqrt(encore_result$V / (encore_result$V + W)) *
+    exp((encore_result$Z ^ 2 * W) / (2 * (encore_result$V + W)))
+  encore_result$PPi <- encore_result$aBF / sum(encore_result$aBF)
+  
+  encore_result <- encore_result[order(-encore_result$PPi),]
+  
+  N <- 0
+  keep_rows <- data.frame()
+  for (j in 1:nrow(encore_result)) {
+    PPi <- encore_result$PPi[j]
+    N <- N + PPi
+    keep_rows <- rbind(keep_rows, encore_result[j,])
+    if (N > .95)
+      break
+  }
+  return(keep_rows)
+}
+```
+
+# Merge eQTL and coloc results
+
+```{r}
+# add coloc PPH4 to main table 
+eQTL <- rio::import("results/flipped.eQTLs.table.GWAS.GTEx.csv")
+coloc.h <- rio::import("results/harbin.coloc.summaries.csv")
+coloc.c <- rio::import("results/ctsn.coloc.summaries.csv")
+
+colnames(coloc.h) <- gsub(".abf", "", colnames(coloc.h))
+colnames(coloc.c) <- gsub(".abf", "", colnames(coloc.c))
+colnames(coloc.h)[-7] <- paste0("Harbin_", colnames(coloc.h)[-7])
+colnames(coloc.c)[-7] <- paste0("CTSN_", colnames(coloc.c)[-7])
+
+coloc_m <- merge(coloc.c, coloc.h)
+coloc_m <- select(coloc_m, 
+                  paires, 
+                  CTSN_nsnps, 
+                  CTSN_PP.H4, 
+                  Harbin_nsnps, 
+                  Harbin_PP.H4)
+
+coloc_m[, c("rsid", "GENEID")] <- strsplit2(coloc_m$paires, "_")
+coloc_m <- mutate(coloc_m,
+                  gene_name = eQTL$gene_name[match(GENEID, eQTL$gene)],
+                  snps = eQTL$snps[match(rsid, eQTL$rsid)],
+                  snps_gene = paste0(snps, "_", gene_name))
+
+## keep eQTLs with significant FDR or H4 > 0.4
+signif_eqtl <- filter(coloc_m, CTSN_PP.H4 > 0.4 | Harbin_PP.H4 > 0.4) %>% 
+  pull(snps_gene)
+res_eQTL <- filter(eQTL, FDR_CTSN < 0.05 |
+                     FDR_Harbin < 0.05 | 
+                     snps_gene %in% signif_eqtl)
+res_eQTL <- merge(res_eQTL,
+                  coloc_m[, c("snps_gene", "Harbin_PP.H4", "CTSN_PP.H4")],
+                  by = "snps_gene", 
+                  all.x = T)
+
+## add DE values
+DEG.c <- readRDS("data/CTSN/RNAseq/DEG.rds")
+DEG.h <- readRDS("data/Harbin/RNAseq/DEG.rds")
+res_eQTL <- res_eQTL %>% 
+  mutate(FDR_DEG_CTSN = DEG.c$padj[match(gene_name, DEG.c$gene_name)],
+         FDR_DEG_Harbin = DEG.h$padj[match(gene_name, DEG.h$gene_name)])
+
+## add Nielson P-values
+N <- read.table(
+  "data/external/nielsen-thorolfsdottir-willer-NG2018-AFib-gwas-summary-statistics.tbl",
+  header = T
+)
+res_eQTL$Nielsen <- N$Pvalue[match(res_eQTL$rsid, N$rs_dbSNP147)] %>% 
+  as.numeric()
+rm(N)
+
+## add Miyazawa S4 info 
+BBJ_sup4 <- rio::import("data/external/BBJ_sup4.txt")
+res_eQTL[, c("Novelty", "Annotated_gene")] <- BBJ_sup4[
+  match(res_eQTL$rsid, BBJ_sup4$rsid), c("Novelty", "Annotated_gene")
+]
+
+rio::export(res_eQTL, "results/eQTL_main_table.csv")
+```
+
+# Finemaping 
+
+```{r}
+credible_sets_analysis <- function(res_eQTL, cis_eqtls, SE, BETA) {
+  results_df <- data.frame()
+  
+  for (i in 1:nrow(res_eQTL)) {
+    loc.i <- filter(cis_eqtls, gene == res_eQTL$gene[i])
+    
+    loc.i[, c("CHROM", "POS")] <- str_split_fixed(loc.i$chr_pos, "_", 2)
+    loc.i$POS <- as.numeric(loc.i$POS)
+    
+    loc.i <- loc.i %>% 
+      filter(dplyr::between(POS,
+                            left = res_eQTL$snp_hg38.pos[i] - 250000,
+                            right = res_eQTL$snp_hg38.pos[i] + 250000)) %>% 
+      dplyr::rename('SE' = SE,
+                    'BETA' = BETA)
+    
+    r.kept <- bayesfactor(objct = loc.i, 
+                          chr = res_eQTL$seqnames[i], 
+                          pos = res_eQTL$snp_hg38.pos[i])
+    
+    r.kept$lead_paire <- res_eQTL$snps_gene[i]
+    results_df <- rbind(r.kept, results_df)
+  }
+  
+  return(results_df)
+}
+
+# eQTL data import
+res_eQTL <- rio::import("results/eQTL_main_table.csv") %>% 
+  filter(CTSN_PP.H4 > 0.4 | Harbin_PP.H4 > 0.4)
+
+cis_eqtls.c <- readRDS("data/CTSN/cis_eqtls.rds") 
+cis_eqtls.h <- readRDS("data/Harbin/cis_eqtls.rds")
+
+## GWAS meta
+# gather all eQTL tested and their GWAS stats  
+snp.add <- which(!cis_eqtls.h$BBJ_variant_id %in% cis_eqtls.c$BBJ_variant_id)
+cis_eqtls <- rbind(cis_eqtls.c, cis_eqtls.h[snp.add, ]) 
+
+results.GWAS <- credible_sets_analysis(res_eQTL, 
+                                       cis_eqtls, 
+                                       "BBJ_standard_error", 
+                                       "BBJ_beta")
+
+## CTSN
+cis_eqtls.c$SE_eQTL <- cis_eqtls.c$beta / cis_eqtls.c$statistic
+results.CTSN <- credible_sets_analysis(res_eQTL, cis_eqtls.c, "SE_eQTL", "beta")
+
+## Harbin
+cis_eqtls.h$SE_eQTL <- cis_eqtls.h$beta / cis_eqtls.h$statistic
+results.Harbin <- credible_sets_analysis(res_eQTL, cis_eqtls.h, "SE_eQTL", "beta")
+```
+
+## merge and save
+
+```{r}
+results.GWAS$dataset <- "BBJ_GWAS" 
+results.CTSN$dataset <- "CTSN_eQTL" 
+results.Harbin$dataset <- "Harbin_eQTL" 
+keep_cols <- c('chr_pos',
+               'snps',
+               'gene',
+               'CHROM',
+               'MAF',
+               'BBJ_variant_id',
+               'BBJ_chromosome',
+               'BBJ_pos.hg19',
+               'BBJ_effect_allele',
+               'BBJ_other_allele',
+               'BBJ_effect_allele_frequency',
+               'BBJ_p_value',
+               'BBJ_MAF',
+               'lead_paire',
+               'dataset',
+               'PPi')
+
+merged.res <- rbind(results.GWAS[, keep_cols], results.CTSN[, c(keep_cols)])
+merged.res <- rbind(merged.res[, keep_cols], results.Harbin[, c(keep_cols)])
+merged.res$gene_name <- strsplit2(merged.res$lead_paire, "_")[, 2]
+saveRDS(merged.res, "results/credible.sets.merged.rds")
+```
+
+## Add credible set sizes (Table S7 and Table 1)
+
+```{r}
+merged.res$lead.snp <- strsplit2(merged.res$lead_paire,"_")[,1]
+
+cs_cols <- c("GWAS.cs.size", "CTSN.cs.size", "Harbin.cs.size")
+datasets <- c("BBJ_GWAS", "CTSN_eQTL", "Harbin_eQTL")
+res_eQTL[, cs_cols] <- sapply(datasets, function(x){
+  sapply(1:nrow(res_eQTL), function(i){ 
+    merged.res %>% 
+      filter(lead.snp == res_eQTL$snps[i] &
+               gene == res_eQTL$gene[i] &
+               dataset == x) %>% 
+      nrow()
+  })
+}) %>% 
+  unlist()
+
+
+# modify FAM13B
+res_eQTL$significance[res_eQTL$gene_name == "FAM13B"] <- "CTSN" 
+
+# find the overlap between confidence sets
+overlap_cs <- sapply(1:nrow(res_eQTL), function(i){ 
+  cs.i <- merged.res %>%
+    filter(lead.snp == res_eQTL$snps[i] & gene == res_eQTL$gene[i]) 
+  
+  cs.i.gwas <- filter(cs.i, dataset == "BBJ_GWAS")
+  if (res_eQTL$significance[i] == "Both") {
+    cs.i.eqtl <- filter(cs.i, dataset != "BBJ_GWAS")
+  }
+  if (res_eQTL$significance[i] == "CTSN") {
+    cs.i.eqtl <- filter(cs.i, dataset == "CTSN_eQTL")
+  }
+  if (res_eQTL$significance[i] == "Harbin") {
+    cs.i.eqtl <- filter(cs.i, dataset == "Harbin_eQTL")
+  }
+  if (res_eQTL$significance[i] == "Not significant") {
+    cs.i.eqtl <- filter(cs.i, dataset == "BBJ_GWAS")
+  }
+  
+  Overlap.cs.size = length(intersect(cs.i.gwas$chr_pos, cs.i.eqtl$chr_pos))
+  Overlap.cs.snps = intersect(cs.i.gwas$BBJ_variant_id, cs.i.eqtl$BBJ_variant_id)
+  if (length(Overlap.cs.snps) == 0) {Overlap.cs.snps <- ""}
+  c(Overlap.cs.size = Overlap.cs.size,
+    Overlap.cs.snps = list(Overlap.cs.snps))
+}) 
+
+res_eQTL <- cbind(res_eQTL, t(overlap_cs))
+
+# find prioritized SNPs
+res_eQTL$Prioritized <- sapply(1:nrow(res_eQTL), function(i) {
+  cs.i <- merged.res %>%
+    filter(lead.snp == res_eQTL$snps[i] &
+             gene == res_eQTL$gene[i] &
+             PPi > 0.1)
+  
+  cs.i.gwas <- filter(cs.i, dataset == "BBJ_GWAS")
+  cs.i.eqtl <- filter(cs.i, dataset != "BBJ_GWAS")
+  
+  intersect(cs.i.gwas$BBJ_variant_id, cs.i.eqtl$BBJ_variant_id) %>% 
+    paste(collapse = ",")
+})
+
+# Used to create Table 1
+rio::export(res_eQTL, "results/eQTL_main_table.cs.csv") 
+
+res_eQTL.filtered <- res_eQTL %>%
+  filter(significance != "Not significant") %>%
+  mutate(Harbin.cs.size = ifelse(significance == "CTSN", "ND", Harbin.cs.size),
+         CTSN.cs.size <- ifelse(significance == "Harbin", "ND", CTSN.cs.size)) %>%
+  select(c("gene_name",
+           "rsid",
+           "significance",
+           "GWAS.cs.size",
+           "CTSN.cs.size",
+           "Harbin.cs.size",
+           "Overlap.cs.size",
+           "Prioritized",
+           "Overlap.cs.snps"))
+
+# Used to create Table S7
+rio::export(res_eQTL.filtered, "results/eQTL_main_table.cs.filtered.csv")
+```
+
+## Table 1
+
+```{r}
+s4 <- read.delim("data/external/BBJ_sup4.txt")
+tab1 <- res_eQTL
+tab1 <- merge(s4, tab1, by.x = "rsid", by.y = "rsid", all.y = T)
+
+# flip betas if AA does not match
+tab1$beta_CTSN_gwas.matched <- ifelse(tab1$ALT == tab1$A1_CTSN,
+                                      tab1$beta_CTSN, 
+                                      (-1 * tab1$beta_CTSN))
+tab1$beta_Harbin_gwas.matched <- ifelse(tab1$ALT == tab1$A1_CTSN,
+                                        tab1$beta_Harbin,
+# using A1_CTSN because Harbin's Beta was already flipped to match CTSN A2
+                                        (-1 * tab1$beta_Harbin)) 
+tab1$AAF_CTSN_gwas.matched <- ifelse(tab1$ALT == tab1$A1_CTSN,
+                                     tab1$MAF_CTSN, 
+                                     abs(tab1$MAF_CTSN - 1))
+tab1$AAF_Harbin_gwas.matched <- ifelse(tab1$ALT == tab1$A1_harbin,
+                                       tab1$MAF_harbin,
+                                       abs(tab1$MAF_harbin - 1))
+
+
+tab1 %>%
+  select(rsid,
+         Chr_pos,
+         ALT,
+         REF,
+         gene_name,
+         BBJ_AAF,
+         BBJ_Beta,
+         BBJ_P,
+         EUR_AAF,
+         EUR_Beta,
+         EUR_P,
+         AAF_CTSN_gwas.matched,
+         beta_CTSN_gwas.matched,
+         FDR_CTSN,
+         AAF_Harbin_gwas.matched,
+         beta_Harbin_gwas.matched,
+         FDR_Harbin) %>% 
+  write.csv("results/Table_1.csv")
+```

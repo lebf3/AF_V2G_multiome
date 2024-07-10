@@ -1,0 +1,938 @@
+---
+title: "Link_plots"
+author: "Francis Leblanc"
+date: '2023-02-06'
+output: html_document
+---
+
+```{r knitr::opts_chunk$set(echo = TRUE),message=FALSE, warning=FALSE}
+library(Seurat)
+library(Signac)
+library(Nebulosa)
+library(GenomicRanges)
+library(ggforce)
+library(rtracklayer)
+library(locuscomparer)
+library(limma)
+library(ggpubr)
+library(patchwork)
+library(ggsci)
+library(dplyr)
+set.seed(2023)
+```
+
+# Functions
+```{r}
+# compute links on meta-cells
+my_linkpeaks <- function(seurat.object = meta.c, 
+                         expression.assay = "RNA",
+                         peak.assay = "ATAC",
+                         expression.slots = "data", 
+                         distance = 5e+05, 
+                         genes.use = genes.test, 
+                         test.type = "stratified", # run correlations within each cell-types
+                         clusters.col = "cell_type") {
+  
+  # pull annotation gr for genes to test and extend by distance
+  a <- Signac::Annotation(seurat.object[[peak.assay]])
+  a <- a[a$gene_name %in% genes.use] 
+  start(a) <- start(a) - distance
+  end(a) <- end(a) + distance
+  
+  # split gr by gene
+  l.gr <- split(a, ~gene_name)
+  l.gr <- l.gr[genes.use]
+  
+  # get links correlations for each genes with links in distance 
+  l.peaks <- lapply(seq_along(l.gr), function(x){
+    
+    # get peaks in distance for that gene
+    peaks.x <- subsetByOverlaps(
+      seurat.object[[peak.assay]]@ranges, l.gr[[x]]
+      ) %>% 
+      GRangesToString()
+    
+    if (test.type == "stratified") { # to run stratified tests in each cluster
+      ct <- seurat.object[[clusters.col]] %>% 
+        unique() %>% 
+        pull(clusters.col)
+      res.strat <- data.frame()
+      
+      for (i in ct) { # subset each cluster
+        keep.c <- which(seurat.object[[clusters.col]] == i)
+        
+        peaks.assay <- GetAssayData(seurat.object,
+                                    slot = expression.slots,
+                                    assay = peak.assay)[peaks.x, keep.c]
+        
+        rna.assay <- GetAssayData(seurat.object,
+                                  slot = expression.slots,
+                                  assay = expression.assay)[genes.use[x], keep.c] 
+        
+        # Pearson R on gene x peaks
+        coef.result <- qlcMatrix::corSparse(X = t(peaks.assay), 
+                                            Y = Matrix::as.matrix(rna.assay)) %>% 
+          as.vector()
+        res.strat.x <- data.frame(PearsonR = coef.result,
+                                  gene = genes.use[x],
+                                  peak = peaks.x,
+                                  cluster = i)
+        colnames(res.strat.x)[4] <- clusters.col
+        res.strat <- rbind(res.strat, res.strat.x)
+        
+      }
+      res.strat
+    }
+    else{ # to run the test in all cells
+      peaks.assay <- GetAssayData(seurat.object, 
+                                  slot = expression.slots,
+                                  assay = peak.assay)[peaks.x, ]
+      
+      rna.assay <- GetAssayData(seurat.object, 
+                                slot = expression.slots,
+                                assay = expression.assay)[genes.use[x], ]
+      
+      # Pearson R on gene x peaks
+      coef.result <- qlcMatrix::corSparse(X = t(peaks.assay), 
+                                          Y = Matrix::as.matrix(rna.assay)) %>% 
+        as.vector()
+      data.frame(PearsonR = coef.result,
+                 gene = genes.use[x],
+                 peak = peaks.x)
+    }
+
+
+    }) %>% 
+    do.call(rbind, .)
+}
+
+# create a links object for LinkPlot2 (adapted from Signac)
+make.link.obj <- function(peak.assay = meta.c@assays$ATAC,
+                          links.df = my_links.strat.CM) {
+  tss <- GetTSSPositions(Annotation(peak.assay), biotypes = NULL)
+  
+  links.df <- links.df %>% 
+    filter(gene %in% tss$gene_name)
+  
+  gr_links <- StringToGRanges(links.df$peak)
+  gr_links@elementMetadata <- DataFrame(links.df)
+  
+  link_start <- tss[match(gr_links$gene, tss$gene_name)]@ranges@start
+  link_end <- round(start(x = gr_links) + (width(x = gr_links) / 2))
+  df.range <- data.frame(start = link_start,
+                         end = link_end) 
+  
+  to.flip <- which(df.range$start > df.range$end)
+  df.range[to.flip, c("start", "end")] <- df.range[to.flip, c("end", "start")]
+  
+  gr_links <- GRanges(gr_links@seqnames,
+                      IRanges(start = df.range$start,
+                              end = df.range$end))
+  
+  gr_links@elementMetadata <- DataFrame(links.df)
+  gr_links$score <- gr_links$PearsonR
+  return(gr_links)
+}
+
+# Make link plot arcs proportional in height to their correlation value (adapted from Signac)
+LinkPlot2 <- function (object, region, min.cutoff = 0) {
+  if (!inherits(x = region, what = "GRanges")) {
+    region <- StringToGRanges(regions = region)
+  }
+  chromosome <- seqnames(x = region)
+  links <- Links(object = object)
+  if (length(x = links) == 0) {
+    return(NULL)
+  }
+  links.keep <- subsetByOverlaps(x = links, ranges = region)
+  link.df <- as.data.frame(x = links.keep)
+  link.df <- link.df[abs(x = link.df$score) > min.cutoff, ]
+  link.df <- link.df[link.df$start >= start(x = region) & 
+                       link.df$end <= end(x = region), ]
+  if (nrow(x = link.df) > 0) {
+    link.df$group <- seq_len(length.out = nrow(x = link.df))
+    
+    df <- data.frame(x = c(link.df$start, 
+                           (link.df$start + link.df$end)/2, 
+                           link.df$end), 
+                     y = c(rep(x = 0, nrow(x = link.df)),
+                           -abs(link.df$score)*2, 
+                           rep(x = 0, nrow(x = link.df))), 
+                     group = rep(x = link.df$group, 3), 
+                     score = rep(link.df$score, 3))
+    
+    p <- ggplot(data = df) + 
+      geom_bezier(mapping = aes_string(x = "x", 
+                                       y = "y", 
+                                       group = "group", 
+                                       color = "score")) + 
+      geom_hline(yintercept = 0, color = "grey") + 
+      scale_color_gradient2(low = "red", mid = "grey", high = "blue")
+  }
+  else {p <- ggplot(data = link.df)}
+  p <- p + 
+    theme_classic() + 
+    theme(axis.ticks.y = element_blank(), axis.text.y = element_blank()) +
+    ylab("Links") + 
+    xlab(label = paste0(chromosome, " position (bp)")) + 
+    xlim(c(start(x = region), end(x = region)))
+  return(p)
+}
+
+
+# functions to extract ATAC fragments from a region (adapted from Signac)
+count.region.fragments <- function(region = region, frag = frag) {
+  fragment.path <- GetFragmentData(object = frag[[1]], slot = "path")
+  cellmap <- GetFragmentData(object = frag[[1]], slot = "cells")
+  tabix.file <- Rsamtools::TabixFile(file = fragment.path)
+  open(con = tabix.file)
+  seqnames.in.both <- intersect(x = seqnames(x = region),
+                                y = Rsamtools::seqnamesTabix(file = tabix.file))
+  
+  file.to.object <- names(x = cellmap)
+  names(x = file.to.object) <- cellmap
+  
+  common.seqlevels <- intersect(x = seqlevels(x = region),
+                                y = Rsamtools::seqnamesTabix(file = tabix.file))
+  region <- keepSeqlevels(x = region,
+                          value = common.seqlevels,
+                          pruning.mode = "coarse")
+  
+  reads <- Rsamtools::scanTabix(file = tabix.file, param = region)
+  reads <- TabixOutputToDataFrame(reads = reads)
+  reads <- reads[fastmatch::fmatch(x = reads$cell,
+                                   table = cellmap,
+                                   nomatch = 0L) > 0, ]
+  reads$cell <- file.to.object[reads$cell]
+  reads$length <- reads$end - reads$start
+  as.data.frame(reads)
+}
+
+TabixOutputToDataFrame <- function (reads, record.ident = TRUE) 
+{
+  if (record.ident) {
+    nrep <- elementNROWS(x = reads)
+  }
+  reads <- unlist(x = reads, use.names = FALSE)
+  if (length(x = reads) == 0) {
+    df <- data.frame(chr = "", start = "", end = "", cell = "", count = "")
+    df <- df[-1, ]
+    return(df)
+  }
+  reads <- stringi::stri_split_fixed(str = reads, pattern = "\t")
+  n <- length(x = reads[[1]])
+  unlisted <- unlist(x = reads)
+  e1 <- unlisted[n * (seq_along(along.with = reads)) - (n - 1)]
+  e2 <- as.numeric(x = unlisted[n * (seq_along(along.with = reads)) - (n - 2)])
+  e3 <- as.numeric(x = unlisted[n * (seq_along(along.with = reads)) - (n - 3)])
+  e4 <- unlisted[n * (seq_along(along.with = reads)) - (n - 4)]
+  e5 <- as.numeric(x = unlisted[n * (seq_along(along.with = reads)) - (n - 5)])
+  df <- data.frame(chr = e1,
+                   start = e2,
+                   end = e3,
+                   cell = e4,
+                   count = e5,
+                   stringsAsFactors = FALSE,
+                   check.rows = FALSE,
+                   check.names = FALSE)
+  if (record.ident) {
+    df$ident <- rep(x = seq_along(along.with = nrep), nrep)
+  }
+  return(df)
+}
+
+# wrapper on locuscompare()
+plot.locus2 <- function(df_chr = gwas_eqtl.fd, 
+                        eQTL = eQTL, 
+                        pop = "EUR", 
+                        cohort = "CTSN") {
+  
+  # create 2 DF for locuscompare() with rsid as character
+  gwas <- data.frame(rsid = df_chr$BBJ_variant_id,
+                     pval = as.numeric(df_chr$BBJ_p_value),
+                     row.names = df_chr$BBJ_variant_id)
+  
+  gwas$rsid <- as.character(gwas$rsid)
+  
+  eqtl <- data.frame(rsid = df_chr$BBJ_variant_id,
+                     pval = as.numeric(df_chr$pvalue),
+                     row.names = df_chr$BBJ_variant_id)
+  
+  eqtl$rsid <- as.character(eqtl$rsid)
+  
+  # GWAS and eQTL zoomed manhattan plots
+  gene_tested <- eQTL$gene_name
+  AF_snp <- eQTL$rsid_alt.SNP
+  
+  locuscompare(in_fn1 = gwas,
+               in_fn2 = eqtl,
+               title1 = 'AF GWAS ',
+               title2 =  paste0(cohort, ' eQTL ', gene_tested),
+               snp = AF_snp,
+               genome = "hg38",
+               population = pop,
+               combine = F)
+}
+```
+
+# Merge Locusplots + coverage plots + links + finemapping
+## Call links in MetaCells
+
+```{r}
+res_eQTL <- rio::import("results/eQTL_main_table.csv") %>% 
+  filter(CTSN_PP.H4 > 0.4 | Harbin_PP.H4 > 0.4)
+
+# add FAM13B
+res_eQTL$significance[res_eQTL$gene_name == "FAM13B"] <- "CTSN"
+res_eQTL <- filter(res_eQTL, significance != "Not significant")
+
+cis_eqtls.c <- readRDS("data/CTSN/cis_eqtls.rds")
+cis_eqtls.h <- readRDS("data/Harbin/cis_eqtls.rds")
+meta.c <- readRDS("data/external/MetaCells_snAF.rds")
+DefaultAssay(meta.c) <- "ATAC"
+
+# genes to test
+genes.test <- res_eQTL$gene_name %>% 
+  unique() %>% 
+  .[which(. %in% row.names(meta.c@assays$RNA))] %>% 
+  .[which(. %in% Signac::Annotation(meta.c[["ATAC"]])$gene_name)] 
+
+# call links by cell-type
+my_links.strat <- my_linkpeaks(seurat.object = meta.c, 
+                               expression.assay = "RNA", 
+                               peak.assay = "ATAC",
+                               expression.slots = "data", 
+                               distance = 1e+06, 
+                               genes.use = genes.test, 
+                               test.type = "stratified", 
+                               clusters.col = "cell_type")
+
+
+my_links.strat.CM <- my_links.strat %>% 
+  filter(abs(PearsonR) > 0.1 & cell_type == "CM")
+gr_links.strat.CM <- make.link.obj(peak.assay = meta.c@assays$ATAC,
+                                   links.df = my_links.strat.CM)
+
+# call links in all cells
+my_links <- my_linkpeaks(seurat.object = meta.c, 
+                         expression.assay = "RNA", 
+                         peak.assay = "ATAC",
+                         expression.slots = "data", 
+                         distance = 1e+06, 
+                         genes.use = genes.test, 
+                         test.type = "none")
+
+gr_links <- make.link.obj(peak.assay = meta.c@assays$ATAC, links.df = my_links)
+```
+
+## plot loop (Figures 2, 3 and S5 to S14)
+### prepare objects
+
+```{r}
+# prepare Seurat object
+seurat_obj <- readRDS("data/external/scAF_peaks2.rds")
+DefaultAssay(seurat_obj) <- "RNA"
+seurat_obj[["chromvar"]] <- NULL
+seurat_obj[["SCT"]] <- NULL
+seurat_obj[["ATAC"]] <- NULL
+
+seurat_obj$cell_type <- seurat_obj$WNN.sub.ct
+seurat_obj$WNN.sub.ct <- gsub("Mast", "Lymphoid", seurat_obj$WNN.sub.ct)
+seurat_obj$WNN.sub.ct <- factor(seurat_obj$WNN.sub.ct)
+seurat_obj@assays$peaks2@fragments[[1]]@path <- "../../../sequencing_datastore/analyses/multiome_LAA_20210802/cellranger_out/AF_multiome/outs/filtered_atac_fragments.tsv.gz"
+
+# Finemapping
+eQTL.cs <- readRDS("results/credible.sets.merged.rds") %>% 
+  mutate(pos = strsplit2(chr_pos, "_")[, 2])
+
+# keep cs if eQTL was significant
+res_eQTL$lead_paire <- paste0(res_eQTL$snps, "_", res_eQTL$gene_name)
+eQTL.cs$significance <- res_eQTL$significance[match(eQTL.cs$lead_paire,
+                                                    res_eQTL$lead_paire)]
+eQTL.cs$keep <- ifelse(eQTL.cs$significance %in% c("Not significant"), F, T)
+
+# keep those that are significant within the dataset they were called in or GWAS
+eQTL.cs$keep <- ifelse( 
+  eQTL.cs$significance %in% c("CTSN", "Harbin"),
+  ifelse(
+    eQTL.cs$significance == "CTSN",
+    ifelse(eQTL.cs$dataset %in% c("BBJ_GWAS", "CTSN_eQTL"), T, F),
+    ifelse(eQTL.cs$dataset %in% c("BBJ_GWAS", "Harbin_eQTL"), T, F) # == Harbin
+  ),
+  eQTL.cs$keep
+)
+
+eQTL.cs <- filter(eQTL.cs, keep)
+
+# fix some miss-labeled SNPs
+cis_eqtls.c$BBJ_variant_id[cis_eqtls.c$snps == "chr2:200119186:C:T"] <- "rs4497857"
+cis_eqtls.h$BBJ_variant_id[cis_eqtls.h$snps == "chr2:200119186:C:T"] <- "rs4497857"
+```
+
+### locus plots
+
+```{r}
+plot_links <- function(gene_i) {
+
+  # colors by cell-type
+  cols <- DiscretePalette(length(unique(seurat_obj$WNN.sub.ct)), 
+                          palette = "alphabet")
+  cols[5] <- "#691919"
+
+  # credible sets
+  eqtl.genei <- filter(eQTL.cs, gene_name %in% gene_i)
+  
+  # plot finemapping PPi 
+  df <-  eqtl.genei %>%
+    mutate(POS = as.numeric(pos),
+           label = ifelse(PPi > 0.1, BBJ_variant_id, NA)) 
+  
+  # keep variants with PPi > 0.1
+  df.top <- df %>% 
+    distinct(label, .keep_all = T) %>% 
+    filter(!is.na(label))
+  
+  region.highlight <- GRanges(df.top$CHROM,
+                              IRanges(start = as.numeric(df.top$POS),
+                                      end = as.numeric(df.top$POS)))
+  region.highlight$gene_id <- df.top$BBJ_variant_id
+  
+  # Get gene coordinates and merge with snps range
+  a <- Signac::Annotation(meta.c@assays$ATAC)
+  a <- c(a[a$gene_name %in% gene_i], region.highlight)
+  gr <- GetTSSPositions(a, biotypes = NULL)
+
+  # for PERM1 there is an error if we extend the end by 5000
+  extend <- ifelse(gene_i == "PERM1", 2000, 5000)
+  gr <- GRanges(seqnames = seqnames(gr)[1],
+                IRanges(start = min(gr@ranges@start) - extend,
+                        end = max(gr@ranges@start + gr@ranges@width) + extend))
+  
+  # ATAC coverage plot
+  DefaultAssay(seurat_obj) <- "RNA"
+  Idents(seurat_obj) <- "WNN.sub.ct"
+  cov_plot <- CoveragePlot(seurat_obj, 
+                           region = gr,
+                           features = c(gene_i),
+                           assay = 'peaks2',
+                           annotation = FALSE,
+                           peaks = F,
+                           links = F,
+                           group.by = "WNN.sub.ct",
+                           window = 250,
+                           downsample.rate = 1) + 
+    geom_vline(xintercept = df.top$POS, alpha = 0.5,linetype = "dashed") +
+    scale_fill_manual(values = cols)
+    
+  # plot finemapping PPi 
+  df <-  df %>%
+    filter(between(POS, start(gr), end(gr)))
+  
+  p <-  ggplot(df, aes(x = POS, y = PPi, color = dataset, label = label)) +
+    geom_hline(yintercept = 0.1, color = "darkred", linetype = "dashed")+
+    geom_point(size = 2) +
+    ylab("PiP") +
+    ggrepel::geom_text_repel(size = 4,
+                             min.segment.length = 0.1,
+                             max.overlaps = 30) +
+    theme_classic()  
+  
+  # gene annotation track
+  DefaultAssay(seurat_obj) <- "peaks2"
+
+  alt.anno <- seurat_obj
+  ano.gr <- subsetByOverlaps(Annotation(meta.c), gr)
+  keep_genes <- Annotation(meta.c)$gene_name %in% ano.gr$gene_name
+  Annotation(alt.anno) <- Annotation(meta.c)[keep_genes]
+  
+  gene_plot <- AnnotationPlot(object = alt.anno,
+                              region = gr) +
+    geom_vline(xintercept = df.top$POS,
+               alpha = 0.5,
+               linetype = "dashed")
+  rm(alt.anno)
+  
+  # peaks track
+  peak_plot <- PeakPlot(object = seurat_obj, region = gr)+ 
+    geom_vline(xintercept = df.top$POS, alpha = 0.5, linetype = "dashed")
+  
+  # gene expression track
+  expr_plot <- ExpressionPlot(object = seurat_obj,
+                              features = gene_i,
+                              assay = "RNA") +
+    scale_fill_manual(values = cols)
+  
+  # set limits in same range for finemapping plot
+  pos.df <- as.data.frame(gr)
+  p <- p + xlim(pos.df$start, pos.df$end)
+  
+  # links in all cells
+  meta.atac.strat <- meta.c@assays$ATAC
+  Links(meta.atac.strat) <- gr_links
+  
+  link.plot.all <- LinkPlot2(object = meta.atac.strat,
+                             region = gr,
+                             min.cutoff = 0.2) + 
+    geom_vline(xintercept = df.top$POS, alpha = 0.5, linetype = "dashed") +
+    labs(color = "Pearson R") + 
+    scale_color_gradient2(low = "red",
+                          mid = "grey",
+                          high = "blue",
+                          limits = c(-1, 1))
+  
+  # links in CM only
+  Links(meta.atac.strat) <- gr_links.strat.CM
+  
+  link.plot.strat <- LinkPlot2(object = meta.atac.strat,
+                               region = gr,
+                               min.cutoff = 0.2) + 
+    geom_vline(xintercept = df.top$POS, alpha = 0.5, linetype = "dashed") +
+    ylab("Links CM") + 
+    labs(color = "CM Pearson R") + 
+    scale_color_gradient2(low = "red",
+                          mid = "grey",
+                          high = "blue",
+                          limits = c(-1, 1))
+  
+  # merge tracks
+  p1 <- CombineTracks(plotlist = list(cov_plot,
+                                      peak_plot,
+                                      gene_plot,
+                                      link.plot.all,
+                                      link.plot.strat,
+                                      p),
+                      expression.plot = expr_plot,
+                      heights = c(10, 0.7, 3, 3, 3, 3),
+                      widths = c(10, 2)) 
+  
+  # dimplot to show celltypes
+  p2 <- DimPlot(seurat_obj, 
+                label = T, 
+                repel = T, 
+                reduction = "harmony_wnn_peaks2_umap",
+                group.by  = "WNN.sub.ct",
+                cols = cols) + 
+    NoAxes() + 
+    theme(legend.position = "bottom") +
+    ggtitle("") + 
+    theme(legend.title = element_text(size = 0),
+          legend.key.size = unit(0.2, 'in'),
+          legend.text = element_text(size = 8)) 
+  
+  # features and density
+  DefaultAssay(seurat_obj) <- "RNA" 
+  p3 <- plot_density(object = seurat_obj, 
+                     reduction = "harmony_wnn_peaks2_umap", 
+                     features = gene_i, 
+                     method = "wkde") + 
+    NoAxes() + 
+    ggtitle(gene_i) + 
+    theme(legend.position = "bottom",
+          legend.text = element_text(size = 8))
+  
+  # Locus plots
+  geneid <- res_eQTL$gene[res_eQTL$gene_name == gene_i]
+  snp_hg38.pos <- res_eQTL$snp_hg38.pos[res_eQTL$gene_name == gene_i]
+
+  ## CTSN
+  df.c <- cis_eqtls.c %>% 
+    filter(gene == geneid) %>%
+    mutate(POS = strsplit2(chr_pos, "_")[, 2]) %>% 
+    filter(dplyr::between(as.numeric(POS), 
+                                 left = snp_hg38.pos - 250000,
+                                 right = snp_hg38.pos + 250000))
+    
+  eQTL <- df.c[which.min(df.c$BBJ_p_value),]
+  eQTL$rsid_alt.SNP <- eQTL$BBJ_variant_id
+  
+  if (eQTL$rsid_alt.SNP == "rs2012809") {eQTL$rsid_alt.SNP <- NULL}
+  p.c <- plot.locus2(df_chr = df.c, eQTL = eQTL, pop = "EUR", cohort = "CTSN")
+  
+  ## Harbin
+  df.h <- cis_eqtls.h %>% 
+    filter(gene == geneid) %>%
+    mutate(POS = strsplit2(chr_pos, "_")[, 2]) %>% 
+    filter(dplyr::between(as.numeric(POS), 
+                                 left = snp_hg38.pos - 250000,
+                                 right = snp_hg38.pos + 250000))
+  
+  p.h <- plot.locus2(df_chr = df.h, eQTL = eQTL, pop = "EAS", cohort = "Harbin")
+  
+  # combine plots and save
+  layout <- "
+  ABGGGG
+  CDGGGG
+  EHGGGG
+  "
+  patch <- wrap_plots(A = p.c$locuszoom1, 
+                      B = p.h$locuszoom1, 
+                      C = p.c$locuszoom2,
+                      D = p.h$locuszoom2, 
+                      E = p2, 
+                      H = p3,
+                      G = p1,
+                      design = layout) + 
+    plot_annotation(title = gene_i)
+  
+  ggsave(plot = patch, 
+         paste0("figs/Locus_plots/", gene_i, ".png"), 
+         width = 20, 
+         height = 12)
+}
+
+# loop for each eGene with some prioritized SNPs
+genes.test <- rio::import("results/Table_S10.csv") %>% 
+  filter(gene_name %in% Signac::Annotation(meta.c[["ATAC"]])$gene_name) %>% 
+  pull(gene_name) %>% 
+  unique() 
+
+for (gene_i in genes.test) {plot_links(gene_i)}
+```
+
+# Plot caQTLs vs eQTLs in MetaCells (bottom of Figure 2,3 and S12 (panels D-F))
+
+```{r}
+# GNB4 peak "chr3-179454910-179455284"
+# KDM1B peak "chr6-18209585-18210058"
+# MAPT peak "chr17-45942197-45942667"
+
+geno <- data.frame(
+  sample = c("CF102","CF97","CF93","CF91","CF77","CF69"),
+  GNB4.rs7612445 = c("GG","GG","GG","GT","GG","GG"),
+  MAPT.rs242557 = c("GG","GA","GA","GG","GA","GA"),
+  KDM1B.rs34969716 = factor(c("GA","AA","GG","GG","GA","GA"),
+                            levels = c("AA","GA","GG"))
+)
+
+plot_peak_gene <- function(gene, peak, snp) {
+  
+  df <- data.frame(gene = meta.c@assays$RNA@data[gene, ],
+                   peak = meta.c@assays$ATAC@data[peak, ],
+                   atac.counts = meta.c$nCount_RNA,
+                   RNA.counts = meta.c$nCount_ATAC,
+                   cell_type = meta.c$cell_type,
+                   Rhythm = meta.c$Rhythm,
+                   sex = meta.c$sex,
+                   sample = meta.c$sample)
+  
+  df <- cbind(df, geno[match(df$sample, geno$sample), -1]) %>%
+    filter(!is.na(get(snp)))
+  
+  df <- df[order(df[[snp]]), ]
+  snp.rs <- strsplit(snp, "[.]")[[1]][2]
+  
+  lims <- list(x = range(df$gene), y = range(df$peak))
+  
+  c.val <- cor(df$peak, df$gene, method = "spearman") %>% 
+    round(digits = 3)
+  
+  p <- ggplot(df, aes_string(x = "gene",
+                             y = "peak",
+                             color = snp,
+                             group = snp)) +
+    geom_point() +
+    cowplot::theme_cowplot() +
+    ggtitle("All cells", subtitle = paste0("Spearman R = ", c.val))  +
+    theme(legend.position = c(1.01, 1.05)) +
+    scale_color_nejm() +
+    scale_fill_nejm() +
+    labs(color = snp.rs) +
+    xlab(paste0(gene, " expression")) +
+    ylab(paste0(peak, " accessibility"))
+  
+  p <- ggExtra::ggMarginal(p, type = "density", groupFill = T)
+  
+  sub.ct <- filter(df, cell_type == "CM")
+  c.val <- cor(sub.ct$peak, sub.ct$gene, method = "spearman") %>% 
+    round(digits = 3)
+  
+  p2 <- ggplot(sub.ct, aes_string(x = "gene", 
+                                  y = "peak", 
+                                  color = snp, 
+                                  group = snp)) +
+    geom_point() +
+    cowplot::theme_cowplot() +
+    ggtitle("CM", subtitle = paste0("Spearman R = ", c.val)) +
+    scale_color_nejm() +
+    scale_fill_nejm() +
+    NoLegend() +
+    xlab(paste0(gene, " expression")) +
+    ylab(paste0(peak, " accessibility"))
+  
+  p2 <- ggExtra::ggMarginal(p2, type = "density", groupFill = T)
+  wrap_plots(list(p, p2))
+}
+
+p.scat.gnb4 <- plot_peak_gene(gene = "GNB4",
+                              peak = "chr3-179454910-179455284",
+                              snp = "GNB4.rs7612445")
+p.scat.kdm1b <- plot_peak_gene(gene = "KDM1B", 
+                               peak = "chr6-18209585-18210058",
+                               snp = "KDM1B.rs34969716")
+p.scat.mapt <- plot_peak_gene(gene = "MAPT", 
+                              peak = "chr17-45942197-45942667", 
+                              snp = "MAPT.rs242557")
+```
+
+## T-tests for caQTLs 
+
+### one sample t-test for GNB4
+
+```{r}
+meta.c@meta.data <- cbind(
+  meta.c@meta.data, geno[match(meta.c$sample, geno$sample), -1]
+  )
+meta.c <- subset(meta.c, subset = sample != "CF89")
+meta.s <- subset(meta.c, subset = cell_type == "CM")
+
+peudo.1st.test <- function(obj = meta.s, assay = "RNA", feature = "MAPT") {
+  
+  # create pseudobulk counts
+  df <- data.frame(feat = obj[[assay]]@data[feature,],
+                 sample = obj$sample)
+  
+  means <- df %>% 
+    group_by(sample) %>% 
+    summarize(Mean = mean(feat)) %>% 
+    pull(Mean)
+
+  t.test(means[-4], mu = means[4])
+}
+
+peudo.1st.test(obj = meta.s, assay = "RNA", feature = "GNB4")
+# p-value = 0.0002124
+peudo.1st.test(obj = meta.s, assay = "ATAC", feature = "chr3-179454910-179455284")
+# p-value = 0.0001918
+```
+
+### two sample t-test for MAPT
+
+```{r}
+peudo.t.test <- function(obj, assay, feature, geno) {
+  
+  # create pseudobulk counts
+  ps.counts <- sapply(unique(obj$sample), function(i){
+    obj[[assay]]@data[feature, ][obj$sample == i] %>% 
+      mean()
+  })
+  
+  df <- data.frame(feat = ps.counts, geno = geno)
+  t.test(feat ~ geno, data = df) 
+}
+
+peudo.t.test(obj = meta.s, 
+             assay = "RNA",
+             feature = "MAPT", 
+             geno = geno$MAPT.rs242557[match(unique(meta.s$sample), 
+                                             geno$sample)])
+# p-value = 0.04277
+peudo.t.test(obj = meta.s, 
+             assay = "ATAC",
+             feature = "chr17-45942197-45942667", 
+             geno = geno$MAPT.rs242557[match(unique(meta.s$sample), 
+                                             geno$sample)])
+# p-value = 0.895
+```
+
+## Plot peak coverage by genotype for MAPT, GNB4 and KDM1B
+
+```{r}
+# GNB4 peak "chr3-179454910-179455284"
+# KDM1B peak "chr6-18209585-18210058"
+# MAPT peak "chr17-45942197-45942667"
+seurat_obj@assays$peaks2@motifs <- NULL # avoids error
+
+peak.cov <- function(region, snp, snp.pos) {
+  lims.x <- strsplit(region, "-")[[1]]
+  Idents(seurat_obj) <- snp
+  subset(seurat_obj, idents = "NA", invert = T) %>%
+    CoveragePlot(region = region,
+                 features = NULL,
+                 assay = 'peaks2',
+                 annotation = F,
+                 peaks = T,
+                 links = F,
+                 group.by = snp,
+                 window = 100,
+                 extend.upstream = 500,
+                 extend.downstream = 500,
+                 downsample.rate = 1) &
+    scale_fill_nejm() &
+    geom_vline(xintercept = snp.pos, linetype = "dashed") &
+    xlim((as.numeric(lims.x[2]) - 500), (as.numeric(lims.x[3]) + 500))
+}
+
+seurat_obj@meta.data <- cbind(
+  seurat_obj@meta.data, geno[match(seurat_obj@meta.data$sample, geno$sample), -1]
+  )
+
+change_col <- c("KDM1B.rs34969716",
+                "GNB4.rs7612445", 
+                "MAPT.rs242557")
+
+for (col in change_col) {
+  seurat_obj@meta.data[[col]] <- as.character(seurat_obj@meta.data[[col]])
+  seurat_obj@meta.data[[col]][is.na(seurat_obj@meta.data[[col]])] <- "NA"
+}
+
+p.cov.kdm1b <- peak.cov(region = "chr6-18209585-18210058", 
+                        snp = "KDM1B.rs34969716", 
+                        snp.pos = 18209878)
+p.cov.gnb4 <- peak.cov(region = "chr3-179454910-179455284",
+                       snp = "GNB4.rs7612445", 
+                       snp.pos = c(179455191, 179455436))
+p.cov.mapt <- peak.cov(region = "chr17-45942197-45942667", 
+                       snp = "MAPT.rs242557", 
+                       snp.pos = 45942346)
+```
+
+## Bulk eQTL box plots 
+
+### CTSN
+
+```{r}
+# cd data/CTSN/MatrixEQTL
+# grep "chr14:76960182:C:T\|chr17:45942346:G:A\|chr3:179455191:G:T\|chr6:18209878:G:A" SNP.txt > top_hits.txt
+
+cis_eqtls <- readRDS( "results/CTSN_cis_eQTLs.sex.7PCs.RDS") # rsid and plink names
+geno <- rio::import("data/CTSN/MatrixEQTL/top_hits.txt") # genotypes 
+GE <- readRDS("data/CTSN/RNAseq/vst.rds") # gene expression 
+
+# arrange order of samples and bind geno + expression  
+geno <- data.frame(row.names = geno$id, geno[ ,colnames(GE)])
+
+g.keep <- cis_eqtls$gene[match(c("LINC01629", "MAPT", "GNB4", "KDM1B") , 
+                               cis_eqtls$gene_name)]
+df.eqtl <- rbind(geno, GE[g.keep, ]) %>% 
+  t() %>% 
+  as.data.frame()
+
+alleles <- strsplit2(colnames(df.eqtl)[1:4], ":")[, c(3, 4)]
+
+# Convert genotypes to allele pairs
+df.eqtl[, 1:4] <- sapply(1:4,  function(x) {
+  geno <- ifelse(df.eqtl[, x] == 2,
+                 paste0(alleles[x, 1], alleles[x, 1]), 
+                 df.eqtl[, x])
+  geno <- ifelse(geno == 1, paste0(alleles[x, 2], alleles[x, 1]), geno)
+  geno <- ifelse(geno == 0, paste0(alleles[x, 2], alleles[x, 2]), geno)
+  geno
+})
+
+
+colnames(df.eqtl)[1:4] <- cis_eqtls$rsid[match(colnames(df.eqtl)[1:4], 
+                                               cis_eqtls$snps)]
+colnames(df.eqtl)[5:8] <- c("LINC01629", "MAPT", "GNB4", "KDM1B")
+
+p.box.mapt.c <- df.eqtl %>%
+  arrange(rs242557) %>%
+  ggpubr::ggboxplot(x = "rs242557",
+                    y = "MAPT",
+                    add = "jitter",
+                    ylab = "Log2 expression MAPT",
+                    title = "CTSN")
+
+p.box.gnb4.c <- df.eqtl %>%
+  arrange(rs7612445) %>%
+  ggpubr::ggboxplot(x = "rs7612445",
+                    y = "GNB4",
+                    add = "jitter",
+                    ylab = "Log2 expression GNB4",
+                    title = "CTSN")
+
+p.box.kdm1b.c <- df.eqtl %>%
+  arrange(rs34969716) %>%
+  ggpubr::ggboxplot(x = "rs34969716",
+                    y = "KDM1B",
+                    add = "jitter",
+                    ylab = "Log2 expression KDM1B",
+                    title = "CTSN")
+```
+
+### Harbin
+
+```{r}
+# cd data/Harbin/MatrixEQTL
+# grep "chr14:76960182:C:T\|chr17:45942346:G:A\|chr3:179455191:G:T\|chr6:18209878:G:A" SNP.txt > top_hits.txt
+
+cis_eqtls <- readRDS("results/Harbin_cis_eQTLs.sex.7PCs.RDS") # rsid and plink names
+geno <- rio::import("data/Harbin/MatrixEQTL/top_hits.txt") # genotypes
+GE <- readRDS("data/Harbin/RNAseq/vst.rds") # gene expression
+colnames(GE) <- gsub("-", ".", colnames(GE))
+
+# arrange order of samples and bind geno + expression  
+geno <- data.frame(row.names = geno$id, geno[ ,colnames(GE)])
+geno["chr17:45942346:G:A",] <- (geno["chr17:45942346:G:A",] - 2) * -1 # flipped 
+
+g.keep <- cis_eqtls$gene[match(c("LINC01629", "MAPT", "GNB4", "KDM1B") , 
+                               cis_eqtls$gene_name)]
+df.eqtl <- rbind(geno, GE[g.keep, ]) %>% 
+  t() %>% 
+  as.data.frame()
+
+alleles <- strsplit2(colnames(df.eqtl)[1:4], ":")[, c(3, 4)]
+
+# Convert genotypes to allele pairs
+df.eqtl[, 1:4] <- sapply(1:4,  function(x) {
+  geno <- ifelse(df.eqtl[, x] == 2,
+                 paste0(alleles[x, 1], alleles[x, 1]), 
+                 df.eqtl[, x])
+  geno <- ifelse(geno == 1, paste0(alleles[x, 2], alleles[x, 1]), geno)
+  geno <- ifelse(geno == 0, paste0(alleles[x, 2], alleles[x, 2]), geno)
+  geno
+})
+
+colnames(df.eqtl)[1:4] <- cis_eqtls$rsid[match(colnames(df.eqtl)[1:4], 
+                                               cis_eqtls$snps)]
+colnames(df.eqtl)[5:8] <- c("LINC01629", "MAPT", "GNB4", "KDM1B")
+
+p.box.mapt.h <- df.eqtl %>%
+  arrange(rs242557) %>%
+  ggpubr::ggboxplot(x = "rs242557",
+                    y = "MAPT",
+                    add = "jitter",
+                    ylab = "Log2 expression MAPT",
+                    title = "Harbin")
+
+p.box.gnb4.h <- df.eqtl %>%
+  arrange(rs7612445) %>%
+  ggpubr::ggboxplot(x = "rs7612445",
+                    y = "GNB4",
+                    add = "jitter",
+                    ylab = "Log2 expression GNB4",
+                    title = "Harbin")
+
+p.box.kdm1b.h <- df.eqtl %>%
+  arrange(rs34969716) %>%
+  ggpubr::ggboxplot(x = "rs34969716",
+                    y = "KDM1B",
+                    add = "jitter",
+                    ylab = "Log2 expression KDM1B",
+                    title = "Harbin")
+```
+
+## combine plots (bottom of Figure 2,3 and S12 (panels D-F))
+
+```{r}
+p.box.gnb4 <- p.box.gnb4.c | p.box.gnb4.h + ylab(NULL)
+p.box.kdm1b <- p.box.kdm1b.c | p.box.kdm1b.h + ylab(NULL)
+p.box.mapt <- p.box.mapt.c | p.box.mapt.h + ylab(NULL)
+
+p.scat.gnb4 + 
+  p.cov.gnb4 + 
+  p.box.gnb4 + 
+  plot_layout(nrow = 1, widths = c(0.2,0.2,0.3,0.18))
+ggsave("figs/Locus_plots/zoom_GNB4.png", width = 20, height = 5)
+
+p.scat.kdm1b + 
+  p.cov.kdm1b + 
+  p.box.kdm1b + 
+  plot_layout(nrow = 1, widths = c(0.2,0.2,0.3,0.18))
+ggsave("figs/Locus_plots/zoom_KDM1B.png", width = 20, height = 5)
+
+p.scat.mapt + 
+  p.cov.mapt +
+  p.box.mapt + 
+  plot_layout(nrow = 1, widths = c(0.2,0.2,0.3,0.18))
+ggsave("figs/Locus_plots/zoom_MAPT.png", width = 20, height = 5)
+```

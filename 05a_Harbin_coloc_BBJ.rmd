@@ -1,0 +1,163 @@
+---
+title: "Harbin coloc BBJ"
+author: "Francis Leblanc"
+date: '2023-02-06'
+output: html_document
+---
+
+```{r knitr::opts_chunk$set(echo = TRUE),message=FALSE, warning=FALSE}
+library(rtracklayer)
+library(dplyr)
+library(coloc)
+library(limma)
+set.seed(2023)
+```
+
+# Colocalization eQTL and Miyazawa GWAS
+
+## Subset hg19 eQTL corresponding windows in Miyazawa GWAS
+
+```{r}
+eQTL <- rio::import("results/flipped.eQTLs.table.GWAS.GTEx.csv")
+eQTL <- eQTL %>% 
+  arrange(FDR_CTSN) %>% 
+  distinct(snps, .keep_all = T)
+
+BBJ <- read.table("data/external/BBJ.GWAS_summary.stat_buildGRCh37.tsv",
+                  header = T)
+
+# get hg19 positions from Miyazawa table S4
+s4 <- rio::import("data/external/BBJ_sup4.txt")
+eQTL[, c("hg19_chr", "hg19_pos")] <- s4$Chr_pos[match(eQTL$rsid, s4$rsid)] %>%
+  strsplit2(., "_") %>%
+  apply(., 2, as.numeric)
+
+gr <- GRanges(seqnames = eQTL$seqnames,
+              ranges = IRanges(start = eQTL$hg19_pos - 250000,
+                               end = eQTL$hg19_pos + 250000), 
+              rsid = eQTL$rsid)
+
+BBJ.gr <- GRanges(seqnames = paste0("chr", BBJ$chromosome),
+                  ranges = IRanges(start = BBJ$base_pair_location,
+                                   end = BBJ$base_pair_location))
+
+BBJ.gr@elementMetadata <- cbind(BBJ.gr@elementMetadata, BBJ)
+BBJ.gr.ol <- subsetByOverlaps(BBJ.gr, gr)
+```
+
+### Convert to hg38
+
+```{r}
+chain <- readRDS("data/external/hg19ToHg38.over.chain.rds")
+BBJ.hg38 <- liftOver(BBJ.gr.ol, chain) %>% 
+  unlist() %>% 
+  as.data.frame()
+BBJ.hg38$chr_pos <- paste0(BBJ.hg38$seqnames, "_", BBJ.hg38$start)
+saveRDS(BBJ.hg38, "data/external/BBJ_eQTLs_250kb.overlap.hg38.rds")
+```
+
+### prepare subset snps overlaping with Harbin
+
+```{r}
+cis_eqtls.h <- readRDS("data/Harbin/MatrixEQTL/250kb_eQTLs_7PCs.RDS")$cis$eqtls
+
+snp_id <- strsplit2(cis_eqtls.h$snps, ":")[, c(1, 2)] %>%
+  as.data.frame()
+cis_eqtls.h$chr_pos <- paste0(snp_id$V1, "_", snp_id$V2)
+```
+
+# Merge eQTL and GWAS
+
+```{r}
+BBJ.hg38 <- BBJ.hg38[, -c(1:5)]
+BBJ.hg38 <- dplyr::rename(BBJ.hg38, "pos.hg19" = "base_pair_location")
+
+# add MAF
+harbin.frq <- read.table("data/Harbin/plink/eQTL_250kb.freq.frq", header = T)
+ckeep <- c("A1", "A2", "MAF")
+cis_eqtls.h[, ckeep] <- harbin.frq[match(cis_eqtls.h$snps, harbin.frq$SNP), 
+                                   ckeep]
+
+
+colnames(BBJ.hg38) <- paste0("BBJ_", colnames(BBJ.hg38))
+cis_eqtls.h <- merge(cis_eqtls.h, 
+                     BBJ.hg38,
+                     by.x = "chr_pos", 
+                     by.y = "BBJ_chr_pos")
+
+cis_eqtls.h$MAF <- as.numeric(cis_eqtls.h$MAF)
+cis_eqtls.h$MAF[which(cis_eqtls.h$MAF == 0)] <- 0.00001 # avoids errors 
+
+cis_eqtls.h$BBJ_MAF <- ifelse(cis_eqtls.h$A1 == cis_eqtls.h$BBJ_effect_allele,
+                              cis_eqtls.h$BBJ_effect_allele_frequency,
+                              abs(cis_eqtls.h$BBJ_effect_allele_frequency - 1))
+saveRDS(cis_eqtls.h, "data/Harbin/cis_eqtls.rds") 
+```
+
+# Run coloc analysis harbin
+
+```{r}
+# Get gene to test for each locus
+l.union <- readRDS("data/eQTL.union_hits.list.rds")
+l.union <- l.union[sapply(l.union, length) > 0]
+
+eQTLs.to.test <- data.frame(rsid = rep(names(l.union), sapply(l.union, length)),
+                            gene = unlist(l.union))
+
+input <- cis_eqtls.h
+# GWAS : 77,690 European AF cases, 1,167,040 European controls, 
+# GWAS : 9,826 Japanese AF cases and 140,446 Japanese controls.
+# eQTL : CTSN cohort 31AF/31SR
+# eQTL : Harbin cohort 28AF/37SR
+
+N_gwas <- 77690 + 1167040 + 9826 + 140446
+S_gwas <- (77690 + 9826) / N_gwas # ratio case/controls
+N_eQTL <- 65
+
+input <- input[order(input$pvalue), ]
+
+# Store results to output in 1 excel sheet
+l.summaries <- list()
+l.results <- list()
+
+for (i in 1:nrow(eQTLs.to.test)) {
+  # subset the gene to test
+  df_chr <- filter(input, gene == eQTLs.to.test[i, "gene"])
+  
+  # subset the variants in locus
+  eQTL.tested <- filter(eQTL, rsid == eQTLs.to.test[i, "rsid"])
+  df_chr$hg38_pos <- as.numeric(strsplit2(df_chr$chr_pos, "_")[, 2])
+  df_chr <- filter(df_chr, between(hg38_pos, 
+                                   eQTL.tested$start - 250000,
+                                   eQTL.tested$start + 250000))
+  if (nrow(df_chr) > 0) {
+    # run coloc analysis on snps overlaping CTSN and GWAS data
+    result <- coloc.abf(dataset1 = list(pvalues = df_chr$BBJ_p_value,
+                                        type = "cc",
+                                        # type = case/control study
+                                        s = S_gwas,
+                                        N = N_gwas,
+                                        snp = df_chr$chr_pos,
+                                        MAF = df_chr$BBJ_MAF),
+                        dataset2 = list(pvalues = df_chr$pvalue,
+                                        type = "quant",
+                                        # type = quantitative study
+                                        N = N_eQTL,
+                                        snp = df_chr$chr_pos,
+                                        MAF = df_chr$MAF))
+    eqtl_idx <- paste0(eQTLs.to.test$rsid[i], "_", eQTLs.to.test$gene[i])
+    l.summaries[[eqtl_idx]] <- result$summary
+    l.results[[eqtl_idx]] <- result$results
+  }
+}
+
+s <- as.data.frame(t(as.data.frame(l.summaries)))
+s$paires <- row.names(s)
+rio::export(s, "results/harbin.coloc.summaries.csv")
+
+for (x in names(l.results)) {
+  l.results[[x]]$snps_gene <- x
+}
+df <- do.call(rbind, l.results)
+saveRDS(df, "data/Harbin/harbin_coloc.rds")
+```

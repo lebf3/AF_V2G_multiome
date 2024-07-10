@@ -1,0 +1,133 @@
+---
+title: "Pop_UMAP"
+author: "Francis Leblanc"
+date: "21/03/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggplot2)
+library(factoextra) 
+library(umap)
+library(snpStats)
+library(pals)
+library(dplyr)
+set.seed(2023)
+```
+
+# PCA with 1000g - On Beluga
+
+```{r}
+fam <- "data/aim.ctsn_harbin_1000G.fam"
+bim <- "data/aim.ctsn_harbin_1000G.bim"
+bed <- "data/aim.ctsn_harbin_1000G.bed"
+
+sample <- read.plink(bed, bim, fam)
+geno <- data.frame(t(as(sample$genotypes, "numeric")))
+
+rmv <- apply(geno, 1, function(x){
+  any(unlist(lapply(x, is.na)))
+  })
+
+# PCA without NA
+pca <- prcomp(geno[!rmv, ])
+pca_ind2 <- as.data.frame(pca$rotation[, 1:50])
+new.names <- sample$fam$pedigree
+new.names[is.na(new.names)] <- sample$fam$member[is.na(new.names)]
+row.names(pca_ind2) <- new.names
+
+pop.1000g <- read.delim(
+  "data/external/integrated_call_samples_v3.20130502.ALL.panel"
+  )
+
+pca_ind2 <- pca_ind2 %>% 
+  mutate(super_pop = pop.1000g$super_pop[match(row.names(.), pop.1000g$sample)],
+         super_pop = ifelse(is.na(super_pop), "CTSN", super_pop),
+         super_pop = ifelse(grepl("-", row.names(.)), "Harbin", super_pop),
+         super_pop = factor(super_pop, levels = c("EUR",
+                                                  "EAS",
+                                                  "AMR",
+                                                  "SAS",
+                                                  "AFR",
+                                                  "CTSN",
+                                                  "Harbin"))) %>% 
+  arrange(super_pop)
+
+cols <- scales::hue_pal()(5)
+cols <- c(cols, "darkred", "black")
+
+ggplot(pca_ind2, aes(x = PC1,
+                     y = PC2,
+                     color = super_pop,
+                     shape = super_pop)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = cols) +
+  scale_shape_manual(values = c(rep(20, 5), 3, 3)) +
+  cowplot::theme_cowplot()
+
+ggsave("figs/Pop_UMAP/PCA_aim.ctsn_harbin_1000G_pops_no.NA.png", 
+       width = 8, 
+       height = 6)
+```
+
+# UMAP
+
+```{r}
+# UMAP without NA
+Geno_AF_umap <- umap(pca_ind2[, 1:10])
+AF_umap <- Geno_AF_umap$layout
+colnames(AF_umap) <- c("UMAP1", "UMAP2")
+AF_umap <- as.data.frame(AF_umap)
+AF_umap$super_pop <- pca_ind2$super_pop
+
+
+ggplot(AF_umap,aes(x = UMAP1,
+                   y = UMAP2,
+                   color = super_pop,
+                   shape = super_pop)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = cols) +
+  scale_shape_manual(values = c(rep(20, 5), 3, 3)) +
+  cowplot::theme_cowplot()
+
+ggsave("figs/Pop_UMAP/UMAP_aim.ctsn_harbin_1000G_pops_no.NA.png", 
+       width = 7,
+       height = 5)
+
+
+AF_umap <- AF_umap %>% 
+  mutate(pop = pop.1000g$pop[match(row.names(.), pop.1000g$sample)],
+         pop = ifelse(is.na(pop), "CTSN", pop),
+         pop = ifelse(grepl("-", row.names(.)), "Harbin", pop))
+
+
+# Zoomed in to EAS
+AF_umap.f <- AF_umap %>%
+  mutate(stroke = ifelse(super_pop %in% c("CTSN", "Harbin"), 1.5, 0.01)) %>% 
+  filter(super_pop %in% c("EAS", "CTSN", "Harbin")) %>% 
+  mutate(pop = factor(pop, levels = c("CDX",
+                                      "CHB", 
+                                      "CHS", 
+                                      "JPT", 
+                                      "KHV", 
+                                      "CTSN",
+                                      "Harbin"))) 
+
+ggplot(AF_umap.f, aes(x = UMAP1, y = UMAP2, color = pop, shape = super_pop)) + 
+  geom_point(size = 3,  stroke = AF_umap.f$stroke) +
+  scale_color_manual(values = c(
+    "#16FF32", "orange", "#3283FE", "#FE00FA", "#5A5156", "darkred", "black"
+             )) +
+  scale_shape_manual(values = c(20, 3, 3)) +
+  xlim(-1, 8) +
+  ylim(-10, -5) +
+  cowplot::theme_cowplot()
+ggsave("figs/Pop_UMAP/UMAP_aim.ctsn_harbin_1000G_pops.detailed.EAS_no.NA.png",
+       width = 7, 
+       height = 5)
+```
+
+
+

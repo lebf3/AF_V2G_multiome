@@ -1,0 +1,125 @@
+---
+title: "GTEx_meta-analysis"
+author: "Francis Leblanc"
+date: '2023-02-06'
+output: html_document
+---
+
+```{r knitr::opts_chunk$set(echo = TRUE), message = FALSE, warning = FALSE}
+library(dplyr)
+library(limma)
+set.seed(2023)
+```
+
+# Table S3 GTEx (eQTLs from Table 1 in GTEx)
+
+```{r}
+res_eQTL <- rio::import("results/eQTL_main_table.csv") %>%
+  dplyr::filter(CTSN_PP.H4 > 0.4 | Harbin_PP.H4 > 0.4)
+
+RAA.gtex <- read.table(
+  "data/external/Heart_Atrial_Appendage.v8.signif_variant_gene_pairs.txt", 
+  header = T
+)
+RAA.gtex$gene_id <- strsplit2(RAA.gtex$gene_id, "[.]")[, 1]
+snp.ID <- strsplit2(RAA.gtex$variant_id, "_")[, 1:2]
+RAA.gtex$snp.ID <- paste0(snp.ID[, 1], ":", snp.ID[, 2])
+RAA.gtex$snp_gene <- paste0(RAA.gtex$snp.ID, "_", RAA.gtex$gene_id)
+
+RAA.gtex.f <- RAA.gtex[match(res_eQTL$snp_gene, RAA.gtex$snp_gene), ]
+
+RAA.gtex.f <- merge(res_eQTL, RAA.gtex.f, by = "snp_gene", all.x = T)
+
+rio::export(RAA.gtex.f[, c("rsid", "gene_name", colnames(RAA.gtex)[-13])],
+            "results/tabS3_GTEx_test.csv") # Table S3
+```
+
+# GTEx meta-analysis 
+
+## prepare GTEx RAA file with all tests
+
+```{r}
+# zcat GTEx_Analysis_v8_QTLs_GTEx_Analysis_v8_eQTL_all_associations_Heart_Atrial_Appendage.allpairs.txt.gz | head | cut -f 2 | cut -d'_' -f1,2 | awk '{print $1 "_"}' > variant_ids.pos.txt
+
+cis_eqtls.c <- readRDS("data/CTSN/cis_eqtls.rds")
+cis_eqtls.h <- readRDS("data/Harbin/cis_eqtls.rds")
+
+# keep overlapping snps between both eQTL datasets only
+snp.keep.c <- paste0(unique(cis_eqtls.c$chr_pos), "_") 
+snp.keep.h <- paste0(unique(cis_eqtls.h$chr_pos), "_")
+snp.keep <- intersect(snp.keep.c, snp.keep.h)
+
+gtex <- rio::import("data/external/variant_ids.pos.txt")
+keep <- which(gtex$variant_id_ %in% snp.keep)
+
+gtex <- rio::import(
+    "data/external/GTEx_Analysis_v8_QTLs_GTEx_Analysis_v8_eQTL_all_associations_Heart_Atrial_Appendage.allpairs.txt.gz" 
+  )
+gtex.snp.ol <- gtex[keep, ]
+saveRDS(gtex.snp.ol, "data/external/GTEx_snp_overlap.rds")
+```
+
+## Combine overlapping GTEx eQTL stats with our cohorts
+
+```{r}
+lead.snps <- read.delim("data/external/BBJ_sup4.txt")$rsid 
+combined <- rio::import("results/flipped.eQTLs.table.GWAS.GTEx.csv") 
+combined <- combined[which(combined$rsid %in% lead.snps), ]
+
+gtex.snp.ol <- readRDS("data/external/GTEx_snp_overlap.rds")
+gtex.snp.ol$gene_id <- strsplit2(gtex.snp.ol$gene_id, "[.]")[, 1]
+snp_ID <- strsplit2(gtex.snp.ol$variant_id, "_")[, 1:2]
+
+gtex.snp.ol <- gtex.snp.ol %>% 
+  mutate(snp.ID = paste0(snp_ID[, 1], ":", snp_ID[, 2])) %>% 
+  mutate(snp_gene = paste0(snp.ID, "_", gene_id)) %>% 
+  filter(snp_gene %in% combined$snp_gene)
+
+combined <- merge(combined, gtex.snp.ol, by = "snp_gene", all.x = T) %>% 
+  mutate(beta_Harbin = sign(statistic_Harbin) * abs(beta_Harbin)) %>%
+  mutate(A1_GTEx = strsplit2(variant_id, "_")[, 3]) %>%
+  mutate(A2_GTEx = strsplit2(variant_id, "_")[, 4])
+```
+
+## Format files for METAL
+
+```{r}
+CTSN <- combined[, c("snp_gene",
+                     "pvalue_CTSN", 
+                     "beta_CTSN", 
+                     "A1_CTSN", 
+                     "A2_CTSN")]
+CTSN$N = 62
+rio::export(CTSN, "data/lead.snps.eqtl.CTSN.tsv")
+
+Harbin <- combined[, c("snp_gene",
+                       "pvalue_Harbin",
+                       "beta_Harbin",
+                       "A1_harbin",
+                       "A2_harbin")]
+Harbin$N = 65
+rio::export(Harbin, "data/lead.snps.eqtl.Harbin.tsv")
+
+GTEx <- combined[, c("snp_gene", "pval_nominal", "slope", "A1_GTEx", "A2_GTEx")]
+GTEx$N = 372
+rio::export(GTEx, "data/lead.snps.eqtl.GTEx.tsv")
+```
+
+## Save METAL output (Table S5)
+
+```{r}
+meta.a <- read.table("data/METAANALYSIS1.TBL", header = T)
+combined.meta <- merge(combined, meta.a, by.y = "MarkerName", by.x = "snp_gene")
+combined.meta$fdr <- p.adjust(combined.meta$P.value, method = "fdr")
+rio::export(combined.meta, "results/eQTL_meta.csv")
+
+combined.meta.sign <- combined.meta %>% 
+  dplyr::filter(fdr < 0.05) %>% 
+  mutate(meta.novel = ifelse(FDR_Harbin < 0.05 | 
+                               FDR_CTSN < 0.05 |
+                               !is.na(RAA.gtex_pval_nominal_threshold),
+                             "F", 
+                             "T"))
+# Table S5
+rio::export(combined.meta.sign, "results/eQTL_meta-analysis.significant.csv")
+```

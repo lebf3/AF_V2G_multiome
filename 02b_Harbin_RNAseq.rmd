@@ -1,0 +1,122 @@
+---
+title: "Harbin_RNAseq"
+author: "Francis Leblanc"
+date: '2023-01-24'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE
+)
+
+library(tximport)
+library(DESeq2)
+library(dplyr)
+library(factoextra)
+library(PCAForQTL)
+set.seed(2023)
+```
+
+# Harbin bulk
+## create count matrix and metadata
+
+```{r}
+tx2gene <- rio::import("data/external/tx2gene.gencode.v32.tsv.gz")
+counts <- rio::import("data/Harbin/RNAseq/transcripts.counts.txt")
+
+colnames(counts)[1] <- "GENEID"
+
+# truncated gene versions, all genes match. Replace with tx2gene GENEID
+counts$GENEID <- tx2gene$GENEID
+
+# Sum the rows of the matrix by GENEID
+counts <- counts %>%
+  dplyr::group_by(GENEID) %>%
+  dplyr::summarize_all(sum)
+
+# make matrix
+counts.m <- as.matrix(counts[, -1])
+counts.m <- apply(counts.m, 2, as.integer)
+row.names(counts.m) <- counts$GENEID
+
+colnames(counts.m) <- gsub("aa_", "AF-", colnames(counts.m))
+colnames(counts.m) <- gsub("ss_", "SR-", colnames(counts.m))
+saveRDS(counts.m, "data/Harbin/RNAseq/counts.rds")
+rio::export(as.data.frame(counts.m),
+            "data/Harbin/RNAseq/counts.harbin.tsv",
+            row.names = T)
+
+# make metadata
+meta <- rio::import("data/Harbin/RNAseq/meta.harbin.tsv")
+row.names(meta) <- meta$sample
+```
+
+## PCA Qc
+
+```{r}
+dds <- DESeqDataSetFromMatrix(counts.m, meta, design = sex ~ condition)
+vst <- vst(dds, blind = T)
+vst.df <- assay(vst)
+saveRDS(vst.df, "data/Harbin/RNAseq/vst.rds")
+
+plotPCA(vst,
+        intgroup = "sex",
+        ntop = 500,
+        returnData = FALSE)
+ggsave("figs/Harbin_RNAseq/PCA.png")
+```
+
+## output DEG
+
+```{r}
+dds$condition <- relevel(dds$condition, ref = "SR")
+min_counts <- rowSums(counts(dds)) >= 10
+dds <- dds[min_counts, ]
+
+dds <- DESeq(dds)
+res <- lfcShrink(dds, coef = "condition_AF_vs_SR", type = "ashr")
+
+res <- as.data.frame(res)
+res$gene_name <- tx2gene$SYMB[match(row.names(res), tx2gene$GENEID)]
+saveRDS(res, "data/Harbin/RNAseq/DEG.rds")
+```
+
+## Test k PCs as covariates
+
+```{r}
+rv <- rowVars(vst.df)
+select <- rv > 0.001
+pca <- prcomp(t(vst.df[select, ]), center = TRUE, scale. = TRUE)
+
+# determine number of PCs to keep as covariates in eQTL
+resultRunElbow <- runElbow(prcompResult = pca)
+resultRunBE <- runBE(t(vst.df[select, ]),
+                     B = 20,
+                     alpha = 0.05,
+                     mc.cores = 1,
+                     verbose = T)
+
+K_elbow <- resultRunElbow # 7
+K_BE <- resultRunBE$numOfPCsChosen # 12
+
+# GTEx uses 60 PEER factors, and they are almost identical to the top 60 PCs.
+K_GTEx <- 60 
+
+png("figs/Harbin_RNAseq/ScreePlot_Harbin_RNAseq.PCs.png",
+    width = 7,
+    height = 5,
+    res = 300,
+    units = "in")
+PCAForQTL::makeScreePlot(pca,
+                         labels = c("Elbow", "BE", "GTEx"),
+                         values = c(K_elbow, K_BE, K_GTEx),
+                         titleText = "Harbin RNAseq")
+dev.off()
+
+covariatesToUse <- cbind(meta[, c("sex", "condition")], pca$x[, 1:7])
+saveRDS(covariatesToUse, "data/Harbin/RNAseq/meta_cov.7PCs.rds")
+```
+

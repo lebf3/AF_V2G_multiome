@@ -1,0 +1,190 @@
+---
+title: "MetaCells"
+author: "Francis Leblanc"
+date: "2023-03-28"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(2022)
+```
+
+```{r}
+library(harmony)
+library(Seurat)
+library(cowplot)
+library(hdWGCNA)
+library(Signac)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(GenomeInfoDb)
+library(dplyr)
+```
+
+# functions 
+
+```{r}
+Cluster_RNA_Harmony <- function(seurat_obj, group.var = "sample", dims = 20) {
+  
+  DefaultAssay(seurat_obj) <- "RNA"
+  SCTransform(seurat_obj, 
+              verbose = FALSE, 
+              vars.to.regress = "percent.mt", 
+              conserve.memory = T) %>% 
+    RunPCA(npcs = dims) %>% 
+    RunHarmony(group.by.vars = c("sample"), assay.use = "SCT") %>% 
+    RunUMAP(dims = 1:dims, 
+            reduction = "harmony",
+            reduction.name = 'umap.rna.harmony', 
+            reduction.key = 'rna.harmony.UMAP_') %>% 
+    FindNeighbors(reduction = "harmony", dims = 1:dims) %>% 
+    FindClusters(verbose = FALSE, resolution = 0.8)
+}
+```
+
+## RNA
+
+```{r}
+# download GEO GSE238242
+seurat_obj <- CreateSeuratObject(
+  counts = readRDS("data/external/snAF.RNA.counts.rds"), 
+  meta.data = readRDS("data/external/snAF.metadata.rds")
+)
+
+seurat_obj@reductions[["harmony"]] <- readRDS("data/external/snAF.reductions.rds")[["harmony"]] 
+seurat_obj@reductions$harmony@assay.used <- "RNA" # throws an error otherwise
+
+# set up 
+DefaultAssay(seurat_obj) <- "RNA"
+seurat_obj <- SetupForWGCNA(seurat_obj,
+                            gene_select = "fraction", 
+                            fraction = 0.05, 
+                            wgcna_name = "AF")
+
+# construct MetaCells in each sample
+seurat_obj <- MetacellsByGroups(min_cells = 75,
+                                seurat_obj = seurat_obj,
+                                reduction = "harmony",
+                                group.by = c("sample"), 
+                                k = 30,
+                                max_shared = 15, 
+                                ident.group = 'sample')
+
+seurat_obj <- NormalizeMetacells(seurat_obj)
+meta.c_rna <- GetMetacellObject(seurat_obj, wgcna_name = "AF")
+meta.c_rna[["percent.mt"]] <- PercentageFeatureSet(meta.c_rna, pattern = "^MT-")
+```
+
+## ATAC 
+
+```{r}
+seurat_obj <- CreateSeuratObject(
+  counts = readRDS("data/external/snAF.peaks.counts.rds"), 
+  meta.data = readRDS("data/external/snAF.metadata.rds"),
+  assay = "peaks2"
+)
+
+seurat_obj@reductions[["harmony"]] <- readRDS("data/external/snAF.reductions.rds")[["harmony"]] 
+seurat_obj@reductions$harmony@assay.used <- "peaks2" # throws an error otherwise
+
+# set up 
+DefaultAssay(seurat_obj) <- "peaks2"
+seurat_obj <- SetupForWGCNA(seurat_obj,
+                            gene_select = "fraction", 
+                            fraction = 0.01, 
+                            wgcna_name = "AF")
+
+# construct MetaCells in each sample
+seurat_obj <- MetacellsByGroups(min_cells = 75,
+                                seurat_obj = seurat_obj,
+                                reduction = "harmony",
+                                group.by = c("sample"), 
+                                k = 30, 
+                                max_shared = 15, 
+                                ident.group = 'sample')
+
+seurat_obj <- NormalizeMetacells(seurat_obj)
+meta.c_atac <- GetMetacellObject(seurat_obj, wgcna_name = "AF")
+meta.c_rna[["ATAC"]] <- meta.c_atac@assays$peaks2
+meta.c <- meta.c_rna
+rm(meta.c_rna, meta.c_atac, seurat_obj)
+gc()
+```
+
+# Create chromatin assay 
+
+```{r}
+atac_counts <- meta.c@assays$ATAC@counts
+
+# add ATAC-seq data
+grange.counts <- StringToGRanges(rownames(atac_counts), sep = c(":", "-"))
+grange.use <- seqnames(grange.counts) %in% standardChromosomes(grange.counts)
+atac_counts <- atac_counts[as.vector(grange.use), ]
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+genome(annotations) <- "hg38"
+
+# change chromosome labels to match Cellranger
+seqlevels(annotations) <- paste0("chr", seqlevels(annotations))
+BSG <- seqinfo(BSgenome.Hsapiens.UCSC.hg38)
+seqlevelsStyle(BSG) <- 'UCSC'
+
+chrom_assay <- CreateChromatinAssay(counts = atac_counts,
+                                    sep = c(":", "-"),
+                                    genome = BSG,
+                                    min.cells = 10,
+                                    annotation = annotations)
+
+# ATAC seurat object
+s.peaks <- CreateSeuratObject(
+  counts = chrom_assay,
+  assay = "ATAC")
+```
+
+# Annotate Meta-Cells
+
+```{r}
+DefaultAssay(meta.c) <- "RNA"
+meta.c <- Cluster_RNA_Harmony(meta.c)
+
+DefaultAssay(meta.c) <- "RNA"
+meta.c$cell_type <- as.character(meta.c$SCT_snn_res.0.8)
+
+meta.c@meta.data <- meta.c@meta.data %>%
+  mutate(cell_type = case_when(
+    cell_type %in% c("0", "5") ~ "FB",
+    cell_type %in% c("8") ~ "SMC",
+    cell_type %in% c("9") ~ "Lymphoid",
+    cell_type %in% c("10") ~ "PC",
+    cell_type %in% c("2") ~ "Meso",
+    cell_type %in% c("1", "3", "11", "9") ~ "CM",
+    cell_type %in% c("7") ~ "Endocardial",
+    cell_type %in% c("4") ~ "EC",
+    cell_type %in% c("6") ~ "Myeloid",
+    cell_type %in% c("12") ~ "Adipo",
+    TRUE ~ cell_type
+  ))
+
+c.keep <- names(which(meta.c$cell_type == "Lymphoid" & meta.c$percent.mt > 2))
+meta.c$cell_type[c.keep] <- "Mt.high"
+```
+
+# Compute Links scores
+
+```{r}
+meta.c[["ATAC"]] <- s.peaks@assays$ATAC
+
+DefaultAssay(meta.c) <- "RNA"
+meta.c <- NormalizeData(meta.c)
+DefaultAssay(meta.c) <- "ATAC"
+meta.c <- NormalizeData(meta.c)
+
+meta.data = readRDS("data/external/snAF.metadata.rds")
+meta.c@meta.data[, c("Rhythm", "sex")] <- meta.data[
+  match(meta.c$sample, meta.data$sample), c("Rhythm","sex")
+  ]
+meta.c <- RegionStats(object = meta.c,
+                      assay = 'ATAC',
+                      genome = BSgenome.Hsapiens.UCSC.hg38)
+saveRDS(meta.c, "data/external/MetaCells_snAF.rds")
+```
